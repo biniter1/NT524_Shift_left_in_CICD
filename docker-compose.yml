@@ -1,0 +1,37 @@
+services:
+  web:
+    build: .
+    command: bash -c "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8091 --workers 1 --reload"
+    volumes:
+      - ./app/:/app/
+    ports:
+      - 8091:8091
+    depends_on:
+      db:
+        condition: service_healthy
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_SERVER=db
+      - POSTGRES_PORT=5432
+      - POSTGRES_DB=restaurant
+  db:
+    image: postgres:15.4-alpine
+    volumes:
+      - pg_volume:/var/lib/postgresql/data/
+    environment:
+      - POSTGRES_USER=admin
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=restaurant
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    healthcheck:
+      test: ["CMD", "sh", "-c", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
+      interval: 5s
+      start_period: 5s
+    expose: 
+      - 5432
+volumes:
+  pg_volume:
