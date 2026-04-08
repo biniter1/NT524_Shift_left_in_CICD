@@ -24,7 +24,7 @@ jobs:
           path: ~/.cache/pre-commit
           key: pre-commit-${{ hashFiles('**/.pre-commit-config.yaml') }}
       - name: Run pre-commit hooks
-        uses: pre-commit/action-hooks@v3.0.1
+        uses: pre-commit/action@v3.0.1
 
   secret-scan:
     runs-on: ubuntu-latest
@@ -52,7 +52,7 @@ jobs:
           config: >-
             p/python
             p/owasp-top-ten
-            p/secerts
+            p/secrerts
         env:
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
       
@@ -103,7 +103,7 @@ jobs:
             -f requirements.txt \
             --output requirements-ci.txt \
             --without-hashes \
-            --without dev   # bỏ qua dev dependencies
+            --without dev   
 
       - name: Install pip-audit
         run: pip install pip-audit
@@ -117,7 +117,7 @@ jobs:
             || true   
 
       - name: Upload audit report
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: pip-audit-report
           path: pip-audit-report.json
@@ -127,6 +127,8 @@ jobs:
         uses: snyk/actions/python@master
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --file=requirements-ci.txt --severity-threshold=high
   unit-test:
     name: "🧪 Unit tests"
     runs-on: ubuntu-latest
@@ -150,7 +152,7 @@ jobs:
     steps:
       - name: Check all CI jobs passed
         run: |
-          count = 0
+          count=0
           if [[ "${{needs.pre-commit.result}}" != "success" ]];
           then
             echo "Job pre-commit not successful"
