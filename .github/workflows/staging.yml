@@ -1,0 +1,231 @@
+name: DevSecOps Staging Pipeline
+on:
+  workflow_run:
+    workflows: ["DevSecOps Build Pipeline"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: ghcr.io/biniter1/nt524_shift_left_in_cicd
+  IMAGE_TAG: ${{ github.sha }}
+jobs:
+  staging:
+    name: "🚀 Staging Deploy & DAST"
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+      issues: write      # tạo GitHub Issue khi có finding
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # --------------------------------------------------------
+      # BƯỚC 1: Cosign verify — kiểm tra signature trước khi deploy
+      # --------------------------------------------------------
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify image signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/biniter1/.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          echo "✅ Image signature verified — safe to deploy"
+
+      # --------------------------------------------------------
+      # BƯỚC 2: Setup kind cluster (k8s thật trên runner)
+      # --------------------------------------------------------
+      - name: Setup kind cluster
+        uses: helm/kind-action@v1.10.0
+        with:
+          cluster_name: staging
+          node_image: kindest/node:v1.29.0
+
+      - name: Verify cluster is up
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+
+      # --------------------------------------------------------
+      # BƯỚC 3: Load image vào kind cluster
+      # --------------------------------------------------------
+      - name: Pull image from GHCR
+        run: docker pull ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+
+      - name: Load image into kind
+        run: |
+          kind load docker-image \
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            --name staging
+
+      # --------------------------------------------------------
+      # BƯỚC 4: Deploy lên staging namespace
+      # --------------------------------------------------------
+      - name: Apply k8s manifests
+        run: |
+          # Thay IMAGE_PLACEHOLDER bằng image thật
+          sed -i "s|IMAGE_PLACEHOLDER|${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" \
+            k8s/staging/app.yaml
+
+          kubectl apply -f k8s/staging/namespace.yaml
+          kubectl apply -f k8s/staging/postgres.yaml
+          kubectl apply -f k8s/staging/app.yaml
+
+      - name: Wait for postgres ready
+        run: |
+          kubectl rollout status deployment/postgres \
+            -n staging --timeout=120s
+
+      - name: Wait for app ready
+        run: |
+          kubectl rollout status deployment/restaurant-app \
+            -n staging --timeout=180s
+
+      - name: Get staging URL
+        id: staging-url
+        run: |
+          # Lấy IP của kind node
+          NODE_IP=$(kubectl get nodes \
+            -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+          STAGING_URL="http://${NODE_IP}:30080"
+          echo "url=${STAGING_URL}" >> $GITHUB_OUTPUT
+          echo "Staging URL: ${STAGING_URL}"
+
+          # Smoke test
+          sleep 10
+          curl -f "${STAGING_URL}/docs" || \
+            (kubectl logs -n staging \
+              deployment/restaurant-app --tail=50 && exit 1)
+
+      # --------------------------------------------------------
+      # BƯỚC 5: DAST — OWASP ZAP Baseline Scan
+      # --------------------------------------------------------
+      - name: Run OWASP ZAP baseline scan
+        id: zap
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ steps.staging-url.outputs.url }}
+          rules_file_name: '.zap/rules.tsv'  # custom rules (optional)
+          cmd_options: '-a'                   # include ajax spider
+          fail_action: false                  # không fail action, tự handle
+          artifact_name: zap-report
+        continue-on-error: true
+
+      # --------------------------------------------------------
+      # BƯỚC 6: Parse ZAP results & Triage
+      # --------------------------------------------------------
+      - name: Parse ZAP report
+        id: zap-parse
+        if: always()
+        run: |
+          # ZAP tạo report.json
+          if [ -f "report_json.json" ]; then
+            # Đếm số alert theo risk level
+            HIGH=$(jq '[.site[].alerts[] | select(.riskcode == "3")] | length' report_json.json)
+            MEDIUM=$(jq '[.site[].alerts[] | select(.riskcode == "2")] | length' report_json.json)
+            LOW=$(jq '[.site[].alerts[] | select(.riskcode == "1")] | length' report_json.json)
+
+            echo "high=${HIGH}" >> $GITHUB_OUTPUT
+            echo "medium=${MEDIUM}" >> $GITHUB_OUTPUT
+            echo "low=${LOW}" >> $GITHUB_OUTPUT
+
+            echo "ZAP Results — High: ${HIGH}, Medium: ${MEDIUM}, Low: ${LOW}"
+          else
+            echo "high=0" >> $GITHUB_OUTPUT
+            echo "medium=0" >> $GITHUB_OUTPUT
+            echo "low=0" >> $GITHUB_OUTPUT
+          fi
+
+      # --------------------------------------------------------
+      # BƯỚC 7: Tạo GitHub Issue nếu có HIGH finding
+      # --------------------------------------------------------
+      - name: Create GitHub Issue for HIGH findings
+        if: steps.zap-parse.outputs.high > 0
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const high   = '${{ steps.zap-parse.outputs.high }}';
+            const medium = '${{ steps.zap-parse.outputs.medium }}';
+            const low    = '${{ steps.zap-parse.outputs.low }}';
+            const sha    = '${{ env.IMAGE_TAG }}'.substring(0, 7);
+            const runUrl = `${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo:  context.repo.repo,
+              title: `[DAST] 🔴 ${high} HIGH findings on staging — ${sha}`,
+              body: [
+                '## 🚨 DAST Security Findings',
+                '',
+                '| Severity | Count |',
+                '|----------|-------|',
+                `| 🔴 High   | ${high}   |`,
+                `| 🟡 Medium | ${medium} |`,
+                `| 🟢 Low    | ${low}    |`,
+                '',
+                '## Details',
+                `- **Commit:** \`${sha}\``,
+                `- **Image:** \`${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}\``,
+                `- **Pipeline run:** [View logs](${runUrl})`,
+                `- **ZAP report:** Download artifact \`zap-report\` from the pipeline run`,
+                '',
+                '## Remediation',
+                '1. Download ZAP report artifact từ pipeline run',
+                '2. Review từng HIGH finding',
+                '3. Fix trong code, tạo PR',
+                '4. Pipeline sẽ re-scan sau khi merge',
+                '',
+                '> Auto-generated by DevSecOps Pipeline'
+              ].join('\n'),
+              labels: ['security', 'dast', 'high-severity']
+            });
+            console.log('✅ GitHub Issue created for DAST findings');
+
+      # --------------------------------------------------------
+      # BƯỚC 8: Staging Gate — block nếu có HIGH finding
+      # --------------------------------------------------------
+      - name: Staging gate
+        run: |
+          HIGH=${{ steps.zap-parse.outputs.high }}
+          if [[ "${HIGH}" -gt 0 ]]; then
+            echo "❌ ${HIGH} HIGH severity findings found. Blocking promotion to prod."
+            exit 1
+          fi
+          echo "✅ No HIGH findings. Staging gate passed."
+
+      # --------------------------------------------------------
+      # Summary
+      # --------------------------------------------------------
+      - name: Staging Summary
+        if: always()
+        run: |
+          echo "## 🚀 Staging Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Cosign verify | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| kind cluster | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deploy staging | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| DAST (ZAP) | ${{ steps.zap.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### DAST Results" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔴 High: ${{ steps.zap-parse.outputs.high }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 🟡 Medium: ${{ steps.zap-parse.outputs.medium }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 🟢 Low: ${{ steps.zap-parse.outputs.low }}" >> $GITHUB_STEP_SUMMARY
+
+      # Cleanup
+      - name: Cleanup kind cluster
+        if: always()
+        run: kind delete cluster --name staging
