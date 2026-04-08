@@ -1,0 +1,168 @@
+name: DevSecOps Build Pipeline
+on:
+  workflow_run:
+    workflows: ["DevSecOps CI/CD Pipeline"]
+    types: [completed]
+    branches: [main]
+env:
+  IMAGE_NAME: ghcr.io/biniter1/nt524_shift_left_in_cicd
+  IMAGE_TAG: ${{ github.sha }}
+jobs:
+  build:
+    name: Build and Scan
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      security-events: write
+    outputs:
+      images: ${{env.IMAGE_NAME}}:${{env.IMAGE_TAG}}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: ${{env.IMAGE_NAME}}:${{env.IMAGE_TAG}}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      
+      - name: Install Syft for SBOM
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Generate Sbom
+        run: |
+          syft ${{env.IMAGE_NAME}}:${{env.IMAGE_TAG}} \
+            -o spdx-json=sbom.spdx.json \
+            -o cyclonedx-json=sbom.cdx.json
+          echo "[OK] SBOM Generated"
+
+      - name: Upload result of SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{env.IMAGE_TAG}}
+          path: |
+            sbom.cdx.json
+            sbom.spdx.json
+      
+      - name: Run Trivy scan image
+        id: trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{env.IMAGE_NAME}}:${{env.IMAGE_TAG}}
+          format: 'sarif'
+          output: trivy-results.sarif
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+        continue-on-error: true
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-image
+      - name: Trivy scan summary
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{env.IMAGE_NAME}}:${{env.IMAGE_TAG}}
+          exit-code: '0'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true     
+      
+      - name: Install Grype
+        uses: anchore/scan-action/download-grype@v3
+
+      - name: Run Grype scan
+        id: grype
+        run: |
+          grype \
+             ${{env.IMAGE_NAME}}:${{env.IMAGE_TAG}} \
+             --fail-on high \
+             --only-fixed \
+             -o sarif > sarif-results.sarif 
+        continue-on-error: true
+      - name: Upload Grype result
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: sarif-results.sarif
+          category: grype-image
+
+      - name: Image Gate
+        run: |
+          trivy_exit="${{steps.trivy.outcome}}"
+          grype_exit="${{steps.grype.outcome}}"
+          
+          if [[ "${trivy_exit}" == "failure" && "${grype_exit}" == "failure" ]];
+          then
+            echo "[CRITICAL] Scan Fail"
+            exit 1
+          fi
+          echo "[OK] Scan Passed"
+      - name: Push image to repo
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+
+          tags: |
+            ${{env.IMAGE_NAME}}:${{env.IMAGE_TAG}}
+            ${{env.IMAGE_NAME}}:latest
+          cache-from: type=gha
+          cache-ti: type=gha,mode=max
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v3.0.5'
+          
+      - name: Sign
+        run: |
+          cosign sign --yes \
+            ${{env.IMAGE_NAME}}:${{env.IMAGE_TAG}} 
+      
+      - name: Attach SBOM to image
+        run: |
+          cosign attest --yes --predicate sbom.cdx.json --type cyclonedx \
+            ${{env.IMAGE_NAME}}:${{env.IMAGE_TAG}}
+
+      - name: Verify image signature
+        run: |
+          cosign verify \
+            --certificate-identity-regexp "https://github.com/biniter1/.*" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          echo "✅ Signature verified"
+          
+      
+            
+          
+
+
+
+
+

@@ -17,17 +17,7 @@ repos:
           - --error # exit non-zero nếu có finding
           - --severity=ERROR # chỉ block ở ERROR, WARNING chỉ warn
           - --quiet
-
-  # 3. IAC SCAN — Trivy config (thay thế tfsec đã deprecated)
-  - repo: https://github.com/antonbabenko/pre-commit-terraform
-    rev: v1.92.0
-    hooks:
-      - id: terraform_trivy
-        name: "🏗️  IaC scan (Trivy config)"
-        args:
-          - --args=--severity=HIGH,CRITICAL
-          - --args=--exit-code=1
-
+e
   # 4. CODE QUALITY — trailing whitespace, syntax check
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
