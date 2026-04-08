@@ -1,36 +1,40 @@
 repos:
-  - repo: https://github.com/PyCQA/autoflake
-    rev: v2.3.1
+  # 1. SECRET SCAN — Gitleaks
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
     hooks:
-      - id: autoflake
-        name: autoflake
-        entry: autoflake
-        "types": [python]
-        require_serial: true
-        language: python
+      - id: gitleaks
+        name: "🔐 Secret scan (Gitleaks)"
+
+  # 2. SAST — Semgrep
+  - repo: https://github.com/semgrep/semgrep
+    rev: v1.72.0
+    hooks:
+      - id: semgrep
+        name: "🔍 SAST (Semgrep)"
         args:
-          - "--remove-all-unused-imports"
-          - "--remove-unused-variables"
-          - "--expand-star-imports"
-  - repo: https://github.com/psf/black
-    rev: 23.7.0
+          - --config=auto
+          - --error # exit non-zero nếu có finding
+          - --severity=ERROR # chỉ block ở ERROR, WARNING chỉ warn
+          - --quiet
+
+  # 3. IAC SCAN — Trivy config (thay thế tfsec đã deprecated)
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.92.0
     hooks:
-      - id: black
-        # It is recommended to specify the latest version of Python
-        # supported by your project here, or alternatively use
-        # pre-commit's default_language_version, see
-        # https://pre-commit.com/#top_level-default_language_version
-        language_version: python3.10
-  - repo: https://github.com/pycqa/isort
-    rev: 5.12.0
+      - id: terraform_trivy
+        name: "🏗️  IaC scan (Trivy config)"
+        args:
+          - --args=--severity=HIGH,CRITICAL
+          - --args=--exit-code=1
+
+  # 4. CODE QUALITY — trailing whitespace, syntax check
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
     hooks:
-      - id: isort
-        name: isort (python)
-  - repo: local
-    hooks:
-      - id: pytest-check
-        name: pytest-check
-        entry: python3 -m pytest
-        language: system
-        pass_filenames: false
-        always_run: true
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+        args: ["--maxkb=500"]
+      - id: detect-private-key # backup layer cho secret detection
