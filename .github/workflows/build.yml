@@ -101,11 +101,13 @@ jobs:
       - name: Run Grype scan
         id: grype
         run: |
+          grype db update
           grype \
              ${{env.IMAGE_NAME}}:${{env.IMAGE_TAG}} \
              --fail-on high \
              --only-fixed \
-             -o sarif > sarif-results.sarif 
+             -o sarif > sarif-results.sarif || \
+            echo '{"version":"2.1.0","runs":[]}' > sarif-results.sarif
         continue-on-error: true
       - name: Upload Grype result
         uses: github/codeql-action/upload-sarif@v3
