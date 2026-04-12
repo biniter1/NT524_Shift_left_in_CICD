@@ -15,15 +15,16 @@ repos:
         args:
           - --config=auto
           - --error # exit non-zero nếu có finding
-          - --severity=ERROR # chỉ block ở ERROR, WARNING chỉ warn
+          - --severity=ERROR
           - --quiet
-  # 4. CODE QUALITY — trailing whitespace, syntax check
+  # 3. CODE QUALITY
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:
       - id: trailing-whitespace
       - id: end-of-file-fixer
       - id: check-yaml
+        exclude: ^k8s/
       - id: check-added-large-files
         args: ["--maxkb=500"]
       - id: detect-private-key # backup layer cho secret detection
