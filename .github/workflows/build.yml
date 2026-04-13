@@ -127,6 +127,7 @@ jobs:
             exit 1
           fi
           echo "[OK] Scan Passed"
+          
       - name: Push image to repo
         uses: docker/build-push-action@v5
         with:
@@ -161,7 +162,7 @@ jobs:
             --certificate-identity-regexp "https://github.com/biniter1/.*" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-          echo "✅ Signature verified"
+          echo "Signature verified"
           
       
             
