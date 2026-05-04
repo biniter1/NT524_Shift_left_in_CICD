@@ -110,7 +110,7 @@ jobs:
              ${{env.IMAGE_NAME}}:${{env.IMAGE_TAG}} \
              --fail-on high \
              --only-fixed \
-             -o sarif > sarif-results.sarif || 
+             -o sarif > sarif-results.sarif
         continue-on-error: true
       - name: Upload Grype result
         uses: github/codeql-action/upload-sarif@v3
