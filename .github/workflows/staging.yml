@@ -48,8 +48,8 @@ jobs:
       - name: Setup SSH key
         run: |
           mkdir -p ~/.ssh
+          install -m 600 /dev/null ~/.ssh/ec2_key.pem
           echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2_key.pem
-          chmod +400 ~/.ssh/ec2_key.pem
           ssh-keyscan -H ${{secrets.EC2_HOST }} >> ~/.ssh/known_hosts
           
       - name: Deploy to EC2
