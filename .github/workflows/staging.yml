@@ -51,7 +51,18 @@ jobs:
           install -m 600 /dev/null ~/.ssh/ec2_key.pem
           echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2_key.pem
           ssh-keyscan -H ${{secrets.EC2_HOST }} >> ~/.ssh/known_hosts
-          
+      - name: Install cosign on EC2
+        run: |
+          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{secrets.EC2_HOST}} << ENDSSH
+            set -e
+            if command -v cosign >/dev/null 2>&1; then
+              curl -O -L https://github.com/sigstore/cosign/releases/download/v2.2.4/cosign-linux-amd64
+              chmod +x cosign-linux-amd64
+              sudo mv cosign-linux-amd64 /usr/local/bin/cosign
+            else
+              cosign version
+            fi
+          ENDSSH
       - name: Deploy to EC2
         run: |
           ssh -i ~/.ssh/ec2_key.pem ubuntu@${{secrets.EC2_HOST}} << ENDSSH
@@ -62,8 +73,8 @@ jobs:
             docker pull ${{env.IMAGE_NAME}}:${{env.IMAGE_TAG}}
 
             cosign verify \
-                --certificate-identity-regexp "https://github.com/biniter1/.*" \
-                --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+              --certificate-identity-regexp "https://github.com/biniter1/.*" \
+              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
                 ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
 
             kind load docker-image \
