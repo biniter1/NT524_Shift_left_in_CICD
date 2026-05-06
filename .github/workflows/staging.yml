@@ -55,7 +55,7 @@ jobs:
         run: |
           ssh -i ~/.ssh/ec2_key.pem ubuntu@${{secrets.EC2_HOST}} << ENDSSH
             set -e
-            if command -v cosign >/dev/null 2>&1; then
+            if ! command -v cosign >/dev/null 2>&1; then
               curl -O -L https://github.com/sigstore/cosign/releases/download/v2.2.4/cosign-linux-amd64
               chmod +x cosign-linux-amd64
               sudo mv cosign-linux-amd64 /usr/local/bin/cosign
