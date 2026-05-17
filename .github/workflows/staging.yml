@@ -157,7 +157,7 @@ jobs:
           rules_file_name: '.zap/rules.tsv'
           cmd_options: '-a'
           fail_action: false
-          artifact_name: zap-report
+          artifact_name: zap_report
         continue-on-error: true
 
       # --------------------------------------------------------
@@ -240,11 +240,11 @@ jobs:
         run: |
           # Kill port-forward trên EC2
           ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
-            "pkill -f 'kubectl port-forward' || true"
+            "pkill -f 'kubectl port-forward' || true" || true
 
           # Xóa namespace staging
           ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
-            "kubectl delete namespace staging --ignore-not-found=true"
+            "kubectl delete namespace staging --ignore-not-found=true" || true
 
           # Kill SSH tunnel local
           pkill -f "ssh.*18000" || true
