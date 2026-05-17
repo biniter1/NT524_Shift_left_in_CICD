@@ -4,12 +4,11 @@ metadata:
   name: app-config
   namespace: staging
 data:
-  POSTGRES_HOST: postgres
+  POSTGRES_SERVER: postgres
   POSTGRES_PORT: "5432"
   POSTGRES_DB: restaurant
   POSTGRES_USER: admin
   POSTGRES_PASSWORD: stagingpassword123
-  ENV: staging
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -28,7 +27,7 @@ spec:
     spec:
       containers:
         - name: app
-          image: IMAGE_PLACEHOLDER # workflow sẽ thay thế bằng image thật
+          image: IMAGE_PLACEHOLDER
           envFrom:
             - configMapRef:
                 name: app-config

@@ -17,12 +17,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 WORKDIR /app
 
-# our Chef sometimes needs to find some files on the filesystem
-# we're allowing to run find with root permissions via sudo
-# in this way, our Chef is able to search everywhere across the filesystem
 RUN echo 'ALL ALL=(ALL) NOPASSWD: /usr/bin/find' | sudo tee /etc/sudoers.d/find_nopasswd > /dev/null
 
-# for security, we're creating a dedicated non-root user
 RUN useradd -m app
 RUN chown app .
 USER app
+
+# Start FastAPI app
+CMD ["bash", "-c", "alembic upgrade head && uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1"]
