@@ -45,8 +45,8 @@ jobs:
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             --type cyclonedx \
             --insecure-ignore-tlog \
-            ${{ env.IMAGE_NAME}}:${{ env.IMAGE_TAG}}
-          echo "[OK] SBOM verify"
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} > /dev/null
+          echo "[OK] SBOM attestation verified"
       - name: Gate check 3 - OPA simulation
         id: check-opa
         run: |
