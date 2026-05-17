@@ -134,6 +134,8 @@ jobs:
 
       - name: Copy k8s production manifest
         run: |
+          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
+            "mkdir -p /home/ubuntu/k8s-production"
           scp -i ~/.ssh/ec2_key.pem -r k8s/production/ \
             ubuntu@${{ secrets.EC2_HOST }}:/home/ubuntu/k8s-production/
 
