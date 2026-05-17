@@ -1,4 +1,5 @@
 name: DevSecOps Staging Pipeline
+
 on:
   workflow_run:
     workflows: ["DevSecOps Build Pipeline"]
@@ -8,29 +9,30 @@ on:
 
 env:
   IMAGE_NAME: ghcr.io/biniter1/nt524_shift_left_in_cicd
-  IMAGE_TAG: "latest"
+  IMAGE_TAG: ${{ github.sha }}
+
 jobs:
   staging:
     name: "🚀 Staging Deploy & DAST"
     runs-on: ubuntu-latest
-    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'workflow_dispatch' }}
+    if: >-
+      github.event.workflow_run.conclusion == 'success' ||
+      github.event_name == 'workflow_dispatch'
     permissions:
       contents: read
       packages: read
       id-token: write
-      issues: write      # tạo GitHub Issue khi có finding
+      issues: write
 
     steps:
-      - name: Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
+      # --------------------------------------------------------
+      # BƯỚC 1: Cosign verify
+      # --------------------------------------------------------
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3
-        with:
-          cosign-release: 'v2.2.4'
 
       - name: Login to GHCR
         uses: docker/login-action@v3
@@ -38,110 +40,135 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Verify image signature
         run: |
           cosign verify \
             --certificate-identity-regexp "https://github.com/biniter1/.*" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+          echo "✅ Image signature verified"
 
-      - name: Setup SSH key
+      # --------------------------------------------------------
+      # BƯỚC 2: Setup SSH
+      # --------------------------------------------------------
+      - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
-          install -m 600 /dev/null ~/.ssh/ec2_key.pem
           echo "${{ secrets.EC2_SSH_KEY }}" > ~/.ssh/ec2_key.pem
-          ssh-keyscan -H ${{secrets.EC2_HOST }} >> ~/.ssh/known_hosts
-      - name: Install cosign on EC2
+          chmod 600 ~/.ssh/ec2_key.pem
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      # --------------------------------------------------------
+      # BƯỚC 3: Deploy lên kind cluster trên EC2
+      # --------------------------------------------------------
+      - name: Copy k8s manifests lên EC2
         run: |
-          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{secrets.EC2_HOST}} << ENDSSH
-            set -e
-            if ! command -v cosign >/dev/null 2>&1; then
-              curl -O -L https://github.com/sigstore/cosign/releases/download/v2.2.4/cosign-linux-amd64
-              chmod +x cosign-linux-amd64
-              sudo mv cosign-linux-amd64 /usr/local/bin/cosign
-            else
-              cosign version
-            fi
-          ENDSSH
-      - name: Deploy to EC2
+          scp -i ~/.ssh/ec2_key.pem -r k8s/staging/ \
+            ubuntu@${{ secrets.EC2_HOST }}:/home/ubuntu/k8s-staging/
+
+      - name: Deploy lên kind cluster
         run: |
-          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{secrets.EC2_HOST}} << ENDSSH
+          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} << ENDSSH
             set -e
-            export KUBECONFIG=$HOME/.kube/config
 
-            kind export kubeconfig --name staging
+            # Pull image từ GHCR
+            echo "${{ secrets.GITHUB_TOKEN }}" | \
+              docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker pull ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
 
-            kubect get node
-            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{github.actor}} --password-stdin
-
-            docker pull ${{env.IMAGE_NAME}}:${{env.IMAGE_TAG}}
-
-            cosign verify \
-              --certificate-identity-regexp "https://github.com/biniter1/.*" \
-              --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-                ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-
+            # Load image vào kind cluster
             kind load docker-image \
               ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
               --name staging
 
+            # Thay IMAGE_PLACEHOLDER bằng image thật
             sed -i "s|IMAGE_PLACEHOLDER|${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" \
-                /home/ubuntu/k8s-staging/app.yaml
+              /home/ubuntu/k8s-staging/app.yaml
 
+            # Cleanup namespace cũ nếu có
             kubectl delete namespace staging --ignore-not-found=true
             sleep 5
 
+            # Apply manifests
             kubectl apply -f /home/ubuntu/k8s-staging/namespace.yaml
             kubectl apply -f /home/ubuntu/k8s-staging/postgres.yaml
             kubectl apply -f /home/ubuntu/k8s-staging/app.yaml
 
-            kubectl rollout status deployment/postgres -n staging --timeout=120s
-            kubectl rollout status deployment/restaurant-app -n staging --timeout=180s
+            # Wait for postgres
+            kubectl rollout status deployment/postgres \
+              -n staging --timeout=120s
+
+            # Wait for app
+            kubectl rollout status deployment/restaurant-app \
+              -n staging --timeout=180s
+
+            echo "✅ App deployed to kind cluster"
           ENDSSH
-      - name: Port forward for ZAP
+
+      # --------------------------------------------------------
+      # BƯỚC 4: Port-forward qua SSH tunnel
+      # Expose app từ kind cluster ra EC2 public IP
+      # Runner SSH tunnel → EC2:8000 → kind pod:8000
+      # --------------------------------------------------------
+      - name: Setup SSH tunnel + port-forward
         run: |
+          # Mở SSH tunnel: localhost:8000 (runner) → EC2:18000
+          # Đồng thời trên EC2: kubectl port-forward → kind pod
           ssh -i ~/.ssh/ec2_key.pem \
             -L 8000:localhost:18000 \
             -N -f \
-            ubuntu@${{secrets.EC2_HOST}}
+            ubuntu@${{ secrets.EC2_HOST }}
 
+          # Trên EC2: kubectl port-forward bind ra 0.0.0.0:18000
           ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
             "nohup kubectl port-forward svc/restaurant-app 18000:8000 \
              -n staging --address 0.0.0.0 > /tmp/pf.log 2>&1 &"
 
-
+          # Đợi tunnel sẵn sàng
           sleep 10
 
+          # Smoke test qua tunnel
           curl -f http://localhost:8000/docs \
-            && echo "Tunnel ok" \
-            || (echo "Tunnel fail")
-      - name: Run ZAP
+            && echo "✅ Tunnel ready" \
+            || (echo "❌ Tunnel failed" && cat /tmp/pf.log && exit 1)
+
+      # --------------------------------------------------------
+      # BƯỚC 5: OWASP ZAP DAST — scan qua tunnel
+      # --------------------------------------------------------
+      - name: Run OWASP ZAP baseline scan
         id: zap
         uses: zaproxy/action-baseline@v0.12.0
         with:
           target: "http://localhost:8000"
-          rules_file_name: ".zap/rules.tsv"
+          rules_file_name: '.zap/rules.tsv'
           cmd_options: '-a'
           fail_action: false
-          artifact_name: zap_report
+          artifact_name: zap-report
         continue-on-error: true
+
+      # --------------------------------------------------------
+      # BƯỚC 6: Parse ZAP results
+      # --------------------------------------------------------
       - name: Parse ZAP report
         id: zap-parse
         if: always()
         run: |
-          if [ -f "report_json.json" ];then
+          if [ -f "report_json.json" ]; then
             HIGH=$(jq '[.site[].alerts[] | select(.riskcode == "3")] | length' report_json.json)
             MEDIUM=$(jq '[.site[].alerts[] | select(.riskcode == "2")] | length' report_json.json)
             LOW=$(jq '[.site[].alerts[] | select(.riskcode == "1")] | length' report_json.json)
           else
-            HIGH=0
-            MEDIUM=0
-            LOW=0
+            HIGH=0; MEDIUM=0; LOW=0
           fi
-          echo "high=${HIGH}">> $GITHUB_OUTPUT
-          echo "medium=${MEDIUM}">> $GITHUB_OUTPUT
-          echo "low=${LOW}">> $GITHUB_OUTPUT
+          echo "high=${HIGH}" >> $GITHUB_OUTPUT
+          echo "medium=${MEDIUM}" >> $GITHUB_OUTPUT
+          echo "low=${LOW}" >> $GITHUB_OUTPUT
+          echo "ZAP — High: ${HIGH}, Medium: ${MEDIUM}, Low: ${LOW}"
 
+      # --------------------------------------------------------
+      # BƯỚC 7: Tạo GitHub Issue nếu có HIGH finding
+      # --------------------------------------------------------
       - name: Create GitHub Issue for HIGH findings
         if: steps.zap-parse.outputs.high > 0
         uses: actions/github-script@v7
@@ -208,3 +235,18 @@ jobs:
 
           # Kill SSH tunnel local
           pkill -f "ssh.*18000" || true
+
+      # Summary
+      - name: Summary
+        if: always()
+        run: |
+          echo "## 🚀 Staging Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Step | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Cosign verify | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Deploy kind/EC2 | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| Port-forward tunnel | ✅ |" >> $GITHUB_STEP_SUMMARY
+          echo "| DAST (ZAP) | ${{ steps.zap.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "- 🔴 High: ${{ steps.zap-parse.outputs.high }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 🟡 Medium: ${{ steps.zap-parse.outputs.medium }}" >> $GITHUB_STEP_SUMMARY
+          echo "- 🟢 Low: ${{ steps.zap-parse.outputs.low }}" >> $GITHUB_STEP_SUMMARY
