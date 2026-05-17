@@ -198,11 +198,21 @@ jobs:
             set -e
             nohup kubectl port-forward svc/restaurant-app 18001:8000 \
               -n production > /tmp/pf-prod.log 2>&1 &
-            sleep 5
 
-            curl -f http://localhost:18001/docs \
-              && echo "[OK] Production app healthy" \
-              || (echo "[ERROR] Production app unhealthy" && cat /tmp/pf-prod.log && exit 1)
+            # Retry 12 lần, mỗi lần cách 5s = 60s total
+            for i in $(seq 1 12); do
+              echo "Attempt ${i}/12..."
+              if curl -sf http://localhost:18001/docs > /dev/null; then
+                echo "[OK] Production app healthy"
+                break
+              fi
+              if [[ $i -eq 12 ]]; then
+                echo "[ERROR] Production app unhealthy after 60s"
+                cat /tmp/pf-prod.log
+                exit 1
+              fi
+              sleep 5
+            done
 
             pkill -f "kubectl port-forward.*18001" || true
           ENDSSH
