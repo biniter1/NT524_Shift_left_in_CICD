@@ -31,7 +31,7 @@ jobs:
         uses: sigstore/cosign-installer@v3
         with:
           cosign-release: 'v2.2.4'
-      
+
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -66,9 +66,9 @@ jobs:
       - name: Deploy to EC2
         run: |
           ssh -i ~/.ssh/ec2_key.pem ubuntu@${{secrets.EC2_HOST}} << ENDSSH
-            set -e 
+            set -e
 
-            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{github.actor}} --password-stdin 
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{github.actor}} --password-stdin
 
             docker pull ${{env.IMAGE_NAME}}:${{env.IMAGE_TAG}}
 
@@ -83,31 +83,31 @@ jobs:
 
             sed -i "s|IMAGE_PLACEHOLDER|${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" \
                 /home/ubuntu/k8s-staging/app.yaml
-            
+
             kubectl delete namespace staging --ignore-not-found=true
             sleep 5
-            
+
             kubectl apply -f /home/ubuntu/k8s-staging/namespace.yaml
             kubectl apply -f /home/ubuntu/k8s-staging/postgres.yaml
             kubectl apply -f /home/ubuntu/k8s-staging/app.yaml
 
             kubectl rollout status deployment/postgres -n staging --timeout=120s
-            kubectl rollout status deployment/restaurant-app -n staging --timeout=180s 
+            kubectl rollout status deployment/restaurant-app -n staging --timeout=180s
           ENDSSH
       - name: Port forward for ZAP
         run: |
           ssh -i ~/.ssh/ec2_key.pem \
             -L 8000:localhost:18000 \
             -N -f \
-            ubuntu@${{secrets.EC2_HOST}} 
+            ubuntu@${{secrets.EC2_HOST}}
 
           ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
             "nohup kubectl port-forward svc/restaurant-app 18000:8000 \
              -n staging --address 0.0.0.0 > /tmp/pf.log 2>&1 &"
 
-            
+
           sleep 10
-          
+
           curl -f http://localhost:8000/docs \
             && echo "Tunnel ok" \
             || (echo "Tunnel fail")
@@ -137,7 +137,7 @@ jobs:
           echo "high=${HIGH}">> $GITHUB_OUTPUT
           echo "medium=${MEDIUM}">> $GITHUB_OUTPUT
           echo "low=${LOW}">> $GITHUB_OUTPUT
-          
+
       - name: Create GitHub Issue for HIGH findings
         if: steps.zap-parse.outputs.high > 0
         uses: actions/github-script@v7
@@ -204,9 +204,3 @@ jobs:
 
           # Kill SSH tunnel local
           pkill -f "ssh.*18000" || true
-
-
-
-
-
-          

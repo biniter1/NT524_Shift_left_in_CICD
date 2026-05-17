@@ -34,7 +34,7 @@ def get_order_status(
     status_value = delivery_data["status"]
 
     raw_sql = f"""
-        UPDATE orders 
+        UPDATE orders
         SET status = '{status_value}'
         WHERE id = {order_id}
     """

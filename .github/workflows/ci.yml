@@ -56,14 +56,14 @@ jobs:
           generateSarif: "1"
         env:
           SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
-          SEMGREP_EXIT_CODE: 0 # bật tạm thời next error 
+          SEMGREP_EXIT_CODE: 0 # bật tạm thời next error
       - name: Upload result of SemGrep
         if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: semgrep.sarif
           category: semgrep
-      
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
@@ -91,7 +91,7 @@ jobs:
           output_format: sarif
           output_file_path: checkov-results.sarif
           soft_fail: true # tạm thời tắt đi demo cho đẹp
-      
+
       - name: Upload Checkov result
         uses: github/codeql-action/upload-sarif@v3
         if: always()
@@ -116,7 +116,7 @@ jobs:
             -f requirements.txt \
             --output requirements-ci.txt \
             --without-hashes \
-            --without dev   
+            --without dev
 
       - name: Install pip-audit
         run: pip install pip-audit
@@ -127,15 +127,15 @@ jobs:
             -r requirements-ci.txt \
             --format=json \
             --output=pip-audit-report.json \
-            || true   
+            || true
 
       - name: Upload audit report
         uses: actions/upload-artifact@v4
         with:
           name: pip-audit-report
           path: pip-audit-report.json
-      
-      
+
+
   unit-test:
     name: "🧪 Unit tests"
     runs-on: ubuntu-latest
@@ -151,7 +151,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: docker compose down -v
-      
+
   ci-gate:
     runs-on: ubuntu-latest
     needs: [pre-commit, secret-scan, sast-iac, dependency-scan, unit-test]
@@ -192,9 +192,3 @@ jobs:
           else
             echo "All jobs passed"
           fi
-
-
-
-
-
-

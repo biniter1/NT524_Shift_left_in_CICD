@@ -120,7 +120,7 @@ def print_welcome_screen():
             Welcome to Damn Vulnerable RESTaurant!
 
             Our restaurant was recently attacked by unknown threat actor!
-            The restaurant's API and underlying system were compromised by 
+            The restaurant's API and underlying system were compromised by
             exploiting various security vulnerabilities.
 
             The owner of the restaurant - Mysterious Chef wants you to
@@ -148,11 +148,11 @@ def print_congrats_screen():
         """
             Congratulations! Great Work!
 
-            You were able to fix all of the vulnerabilities exploited 
+            You were able to fix all of the vulnerabilities exploited
             during the attack!
 
             However, we are aware about other vulnerabilities in the system.
-            Also, there is one more vulnerability that allows to execute 
+            Also, there is one more vulnerability that allows to execute
             commands on the server as a root user but you need to find it
             on your own :)
 

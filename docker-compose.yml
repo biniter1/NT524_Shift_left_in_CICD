@@ -31,7 +31,7 @@ services:
       test: ["CMD", "sh", "-c", "pg_isready -d $${POSTGRES_DB} -U $${POSTGRES_USER}"]
       interval: 5s
       start_period: 5s
-    expose: 
+    expose:
       - 5432
 volumes:
   pg_volume:
