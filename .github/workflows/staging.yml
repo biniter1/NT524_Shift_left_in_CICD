@@ -9,7 +9,7 @@ on:
 
 env:
   IMAGE_NAME: ghcr.io/biniter1/nt524_shift_left_in_cicd
-  IMAGE_TAG: ${{ github.sha }}
+  IMAGE_TAG: latest
 
 jobs:
   staging:
