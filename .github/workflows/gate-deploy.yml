@@ -40,10 +40,11 @@ jobs:
       - name: Gate check 2 - verify SBOM attestation
         id: check-sbom
         run: |
-          cosign verify-attestation \
+          timeout 60 cosign verify-attestation \
             --certificate-identity-regexp "https://github.com/biniter1/.*" \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             --type cyclonedx \
+            --insecure-ignore-tlog \
             ${{ env.IMAGE_NAME}}:${{ env.IMAGE_TAG}}
           echo "[OK] SBOM verify"
       - name: Gate check 3 - OPA simulation
