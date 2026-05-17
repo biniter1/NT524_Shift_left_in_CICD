@@ -75,33 +75,48 @@ jobs:
             echo "${{ secrets.GITHUB_TOKEN }}" | \
               docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
+            # Xóa image cũ, pull fresh
+            docker rmi ghcr.io/biniter1/nt524_shift_left_in_cicd:latest || true
             docker pull --platform linux/amd64 \
-              ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+              ghcr.io/biniter1/nt524_shift_left_in_cicd:latest
 
-            # Dùng docker save → kind load image-archive
-            docker save ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            # Save thành tar
+            docker save ghcr.io/biniter1/nt524_shift_left_in_cicd:latest \
               -o /tmp/app-image.tar
 
-            kind load image-archive /tmp/app-image.tar --name staging
+            # Copy vào kind control-plane container
+            docker cp /tmp/app-image.tar staging-control-plane:/image.tar
 
+            # Import trực tiếp vào containerd
+            docker exec staging-control-plane \
+              ctr --namespace=k8s.io images import /image.tar
+
+            # Cleanup tar
             rm -f /tmp/app-image.tar
+            docker exec staging-control-plane rm -f /image.tar
 
-            sed -i "s|IMAGE_PLACEHOLDER|${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" \
+            echo "✅ Image loaded into kind cluster"
+
+            # Thay IMAGE_PLACEHOLDER
+            sed -i "s|IMAGE_PLACEHOLDER|ghcr.io/biniter1/nt524_shift_left_in_cicd:latest|g" \
               /home/ubuntu/k8s-staging/app.yaml
 
+            # Cleanup namespace cũ
             kubectl delete namespace staging --ignore-not-found=true
             sleep 5
 
+            # Apply manifests
             kubectl apply -f /home/ubuntu/k8s-staging/namespace.yaml
             kubectl apply -f /home/ubuntu/k8s-staging/postgres.yaml
             kubectl apply -f /home/ubuntu/k8s-staging/app.yaml
 
+            # Wait ready
             kubectl rollout status deployment/postgres \
               -n staging --timeout=120s
             kubectl rollout status deployment/restaurant-app \
               -n staging --timeout=180s
 
-            echo "✅ App deployed"
+            echo "✅ App deployed to kind cluster"
           ENDSSH
 
       # --------------------------------------------------------
