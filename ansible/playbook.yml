@@ -1,0 +1,133 @@
+---
+- name: Setup EC2 Staging Environment
+  hosts: staging
+  become: true
+
+  vars:
+    kind_version: "v0.22.0"
+    kubectl_version: "v1.29.0"
+    cosign_version: "v2.2.4"
+    cluster_name: "staging"
+    k8s_staging_dir: "/home/ubuntu/k8s-staging"
+
+  tasks:
+    # ── Docker ──────────────────────────────────────────────
+    - name: Install Docker dependencies
+      apt:
+        name:
+          - apt-transport-https
+          - ca-certificates
+          - curl
+          - gnupg
+          - lsb-release
+        state: present
+        update_cache: yes
+
+    - name: Add Docker GPG key
+      apt_key:
+        url: https://download.docker.com/linux/ubuntu/gpg
+        state: present
+
+    - name: Add Docker repo
+      apt_repository:
+        repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+        state: present
+
+    - name: Install Docker CE
+      apt:
+        name:
+          - docker-ce
+          - docker-ce-cli
+          - containerd.io
+          - docker-compose-plugin
+        state: present
+        update_cache: yes
+
+    - name: Add ubuntu user to docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: yes
+
+    - name: Start and enable Docker
+      service:
+        name: docker
+        state: started
+        enabled: yes
+
+    # ── kubectl ─────────────────────────────────────────────
+    - name: Download kubectl
+      get_url:
+        url: "https://dl.k8s.io/release/{{ kubectl_version }}/bin/linux/amd64/kubectl"
+        dest: /usr/local/bin/kubectl
+        mode: "0755"
+
+    # ── kind ────────────────────────────────────────────────
+    - name: Download kind
+      get_url:
+        url: "https://kind.sigs.k8s.io/dl/{{ kind_version }}/kind-linux-amd64"
+        dest: /usr/local/bin/kind
+        mode: "0755"
+
+    # ── cosign ──────────────────────────────────────────────
+    - name: Download cosign
+      get_url:
+        url: "https://github.com/sigstore/cosign/releases/download/{{ cosign_version }}/cosign-linux-amd64"
+        dest: /usr/local/bin/cosign
+        mode: "0755"
+
+    # ── kind cluster ────────────────────────────────────────
+    - name: Check kind cluster exists
+      command: kind get clusters
+      register: kind_clusters
+      become: true
+      changed_when: false
+      ignore_errors: true
+
+    - name: Create kind cluster
+      command: kind create cluster --name {{ cluster_name }}
+      become: true
+      when: cluster_name not in kind_clusters.stdout
+
+    - name: Verify cluster is up
+      command: kubectl cluster-info --context kind-{{ cluster_name }}
+      become: true
+      changed_when: false
+
+    # ── k8s manifests dir ───────────────────────────────────
+    - name: Create k8s-staging directory
+      file:
+        path: "{{ k8s_staging_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0755"
+
+    - name: Copy k8s manifests
+      copy:
+        src: "../k8s/staging/"
+        dest: "{{ k8s_staging_dir }}/"
+        owner: ubuntu
+        group: ubuntu
+        mode: "0644"
+
+    # ── Verify ──────────────────────────────────────────────
+    - name: Verify docker
+      command: docker --version
+      become: false
+      changed_when: false
+
+    - name: Verify kubectl
+      command: kubectl version --client
+      become: false
+      changed_when: false
+
+    - name: Verify kind
+      command: kind version
+      become: false
+      changed_when: false
+
+    - name: Verify cosign
+      command: cosign version
+      become: false
+      changed_when: false
