@@ -75,7 +75,7 @@ jobs:
             # Pull image từ GHCR
             echo "${{ secrets.GITHUB_TOKEN }}" | \
               docker login ghcr.io -u ${{ github.actor }} --password-stdin
-            docker pull ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            docker pull --platform linux/amd64 ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
 
             # Load image vào kind cluster
             kind load docker-image \
