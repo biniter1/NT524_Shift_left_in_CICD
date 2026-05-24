@@ -48,14 +48,6 @@ jobs:
               echo "❌ No SBOM attestation found"
               exit 1
             fi
-          # timeout 60 cosign verify-attestation \
-          #   --certificate-identity-regexp "https://github.com/biniter1/.*" \
-          #   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-          #   --type cyclonedx \
-          #   --insecure-ignore-tlog \
-          #   --insecure-ignore-sct \
-          #   ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} > /dev/null
-          # echo "[OK] SBOM attestation verified"
       - name: Gate check 3 - OPA simulation
         id: check-opa
         run: |
@@ -113,6 +105,23 @@ jobs:
           fi
 
           echo "✅ All policies passed — cleared for production"
+      # GATE 4 Trivy scan image
+      - name: Verify Trivy scan
+        id: trivy
+        uses: aquasecurtiy/trivy-action@0.24.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG}}
+          format: 'table'
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+      # GATE 5 Verify K8S config
+      - name: Verify K8S config
+        id: k8s-config
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: config
+          scan-ref: k8s/production
+
       - name: Gate summary
         if: always()
         run: |
@@ -122,6 +131,8 @@ jobs:
           echo "| Image Signature | ${{ steps.check-signature.outcome }} |" >> $GITHUB_STEP_SUMMARY
           echo "| SBOM Attestation | ${{ steps.check-sbom.outcome }} |" >> $GITHUB_STEP_SUMMARY
           echo "| OPA Policy Checks | ${{ steps.check-opa.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trivy Scan | ${{ steps.trivy.outcome }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| K8S Config | ${{ steps.k8s-config.outcome }} |" >> $GITHUB_STEP_SUMMARY
   production:
     name: "Production Deploy"
     runs-on: ubuntu-latest

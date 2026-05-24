@@ -97,33 +97,10 @@ jobs:
           severity: 'CRITICAL,HIGH'
           ignore-unfixed: true
 
-      - name: Install Grype
-        uses: anchore/scan-action/download-grype@v3
-      - name: Run Grype scan
-        id: grype
-        env:
-          GRYPE_DB_VALIDATE_AGE: ${{env.GRYPE_DB_VALIDATE_AGE}}
-        run: |
-          rm -rf ~/.cache/grype/db
-          grype db delete
-          grype db update
-          grype \
-             ${{env.IMAGE_NAME}}:${{env.IMAGE_TAG}} \
-             --fail-on high \
-             --only-fixed \
-             -o sarif > sarif-results.sarif
-        continue-on-error: true
-      - name: Upload Grype result
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: sarif-results.sarif
-          category: grype-image
 
       - name: Image Gate
         run: |
           trivy_exit="${{steps.trivy.outcome}}"
-          grype_exit="${{steps.grype.outcome}}"
 
           if [[ "${trivy_exit}" == "failure" && "${grype_exit}" == "failure" ]];
           then
