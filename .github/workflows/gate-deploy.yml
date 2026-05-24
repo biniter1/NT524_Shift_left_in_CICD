@@ -106,22 +106,25 @@ jobs:
 
           echo "✅ All policies passed — cleared for production"
       # GATE 4 Trivy scan image
-      - name: Verify Trivy scan
+      - name: GATE 4 Verify Trivy scan
         id: trivy
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG}}
           format: 'table'
           severity: HIGH,CRITICAL
-          exit-code: '0' 
+          exit-code: '1'
+        continue-on-error: true
+
       # GATE 5 Verify K8S config
-      - name: Verify K8S config
+      - name: GATE 5 Verify K8S config
         id: k8s-config
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: config
           scan-ref: k8s/production
-          exit-code: '0'
+          exit-code: '1'
+        continue-on-error: true
 
       - name: Gate summary
         if: always()
