@@ -33,14 +33,14 @@ jobs:
         uses: sigstore/cosign-installer@v3
 
       - name: Trviy scan image
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG}}
           format: 'table'
           severity: HIGH,CRITICAL
           exit-code: '1'
       - name: Verify K8S config
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@master
         with:
           scan-type: config
           scan-ref: k8s/staging

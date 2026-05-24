@@ -108,7 +108,7 @@ jobs:
       # GATE 4 Trivy scan image
       - name: Verify Trivy scan
         id: trivy
-        uses: aquasecurtiy/trivy-action@0.24.0
+        uses: aquasecurtiy/trivy-action@master
         with:
           image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG}}
           format: 'table'
@@ -117,7 +117,7 @@ jobs:
       # GATE 5 Verify K8S config
       - name: Verify K8S config
         id: k8s-config
-        uses: aquasecurity/trivy-action@0.24.0
+        uses: aquasecurity/trivy-action@master
         with:
           scan-type: config
           scan-ref: k8s/production
