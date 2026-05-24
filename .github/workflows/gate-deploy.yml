@@ -144,7 +144,7 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
@@ -165,7 +165,7 @@ jobs:
             set -e
             export HOME=/home/ubuntu
             echo "${{secrets.GITHUB_TOKEN}}" | docker login ghcr.io -u ${{github.actor}} --password-stdin
-            
+
             docker rmi  ghcr.io/biniter1/nt524_shift_left_in_cicd:latest || true
             docker pull --platform linux/amd64 ghcr.io/biniter1/nt524_shift_left_in_cicd:latest
             docker save ghcr.io/biniter1/nt524_shift_left_in_cicd:latest -o /tmp/app-image.tar
@@ -227,7 +227,7 @@ jobs:
 
             pkill -f "kubectl port-forward.*18001" || true
           ENDSSH
-          
+
       - name: Deploy summary
         if: always()
         run: |
