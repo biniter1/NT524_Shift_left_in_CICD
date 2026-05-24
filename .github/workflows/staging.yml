@@ -113,7 +113,7 @@ jobs:
             # Thay IMAGE_PLACEHOLDER
             sed -i "s|IMAGE_PLACEHOLDER|ghcr.io/biniter1/nt524_shift_left_in_cicd:latest|g" \
               /home/ubuntu/k8s-staging/app.yaml
-
+            kind export kubeconfig --name staging
             # Cleanup namespace cũ
             kubectl delete namespace staging --ignore-not-found=true
             sleep 5

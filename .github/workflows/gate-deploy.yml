@@ -176,6 +176,7 @@ jobs:
             docker exec staging-control-plane rm -f /image.tar
             sed -i "s|IMAGE_PLACEHOLDER|ghcr.io/biniter1/nt524_shift_left_in_cicd:latest|g" \
               /home/ubuntu/k8s-production/app.yaml
+            kind export kubeconfig --name production
             kubectl delete namespace production --ignore-not-found=true
             sleep 5
             kubectl apply -f /home/ubuntu/k8s-production/namespace.yaml
