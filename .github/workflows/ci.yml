@@ -55,7 +55,6 @@ jobs:
             p/secrets
           generateSarif: "1"
         env:
-          SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
           SEMGREP_EXIT_CODE: 0 # bật tạm thời next error
       - name: Upload result of SemGrep
         if: always()
