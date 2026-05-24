@@ -108,7 +108,7 @@ jobs:
       # GATE 4 Trivy scan image
       - name: Verify Trivy scan
         id: trivy
-        uses: aquasecurtiy/trivy-action@master
+        uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG}}
           format: 'table'
@@ -176,7 +176,7 @@ jobs:
             docker exec staging-control-plane rm -f /image.tar
             sed -i "s|IMAGE_PLACEHOLDER|ghcr.io/biniter1/nt524_shift_left_in_cicd:latest|g" \
               /home/ubuntu/k8s-production/app.yaml
-            kind export kubeconfig --name production
+            kind export kubeconfig --name staging
             kubectl delete namespace production --ignore-not-found=true
             sleep 5
             kubectl apply -f /home/ubuntu/k8s-production/namespace.yaml
