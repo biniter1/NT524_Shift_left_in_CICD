@@ -287,16 +287,16 @@ jobs:
           CRITICAL_SAST=0
           if [ -f "./results/semgrep.sarif" ]; then
             CRITICAL_SAST=$(python3 -c "
-import json
-try:
-    data = json.load(open('./results/semgrep.sarif'))
-    errors = sum(1 for run in data.get('runs', [])
-                 for r in run.get('results', [])
-                 if r.get('level') == 'error')
-    print(errors)
-except:
-    print(0)
-")
+            import json
+            try:
+                data = json.load(open('./results/semgrep.sarif'))
+                errors = sum(1 for run in data.get('runs', [])
+                            for r in run.get('results', [])
+                            if r.get('level') == 'error')
+                print(errors)
+            except:
+                print(0)
+            ")
           fi
 
           echo "" >> $GITHUB_STEP_SUMMARY
