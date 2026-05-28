@@ -217,7 +217,7 @@ jobs:
           name: lib-pr-${{ github.sha }}
           path: library-scan-pr.json
 
-  gate:
+  gate-pre-scan:
     name: "Gate PR Scan"
     runs-on: ubuntu-latest
     needs: [sast, config-scan, dependency-scan, library-scan]
