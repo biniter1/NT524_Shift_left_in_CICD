@@ -144,16 +144,16 @@ jobs:
             kubectl apply -f /home/ubuntu/k8s-staging/postgres.yaml
             sed "s|IMAGE_PLACEHOLDER|\
             ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" \
-                          /home/ubuntu/k8s-staging/app.yaml \
-                          | kubectl apply -f -
+            /home/ubuntu/k8s-staging/app.yaml \
+            | kubectl apply -f -
 
-                        kubectl rollout status deployment/postgres \
+            kubectl rollout status deployment/postgres \
                           -n staging --timeout=120s
-                        kubectl rollout status deployment/restaurant-app \
+            kubectl rollout status deployment/restaurant-app \
                           -n staging --timeout=180s
 
-                        echo "✅ Deployed to staging"
-                      ENDSSH
+            echo "✅ Deployed to staging"
+          ENDSSH
 
       # Alpha — Smoke test
       - name: Smoke test (Alpha)
