@@ -1,0 +1,316 @@
+name: PR Scan
+
+on:
+  pull_request:
+    branches:
+      - develop
+    types: [opened, synchronize, reopened]
+
+jobs:
+  sast:
+    name: "SAST (Semgrep diff-only)"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Fix 1: fetch develop để baseline-commit hoạt động
+      - name: Fetch develop branch
+        run: git fetch origin develop
+
+      # Fix 12: dùng official semgrep action
+      - name: Run Semgrep diff-only
+        uses: semgrep/semgrep-action@v1
+        with:
+          config: >-
+            p/python
+            p/owasp-top-ten
+            p/secrets
+          generateSarif: "1"
+          publishToken: ${{ secrets.SEMGREP_APP_TOKEN }}
+        env:
+          SEMGREP_BASELINE_REF: origin/develop
+        continue-on-error: true
+
+      - name: Upload Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep-pr
+
+      - name: Save SAST results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sast-pr-${{ github.sha }}
+          path: semgrep.sarif
+
+  config-scan:
+    name: "Config Scan (Checkov diff-only)"
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Fix 1: fetch develop
+      - name: Fetch develop branch
+        run: git fetch origin develop
+
+      - name: Get changed config files
+        id: config-check
+        run: |
+          git diff --name-only origin/develop...HEAD \
+            | grep -E '\.(tf|yaml|yml|json)$' \
+            | grep -E '^(terraform/|k8s/|ansible/)' \
+            > changed_configs.txt || true
+
+          echo "Changed config files:"
+          cat changed_configs.txt || echo "None"
+
+          # Fix 2: dùng -s check file rỗng hay không
+          if [ -s changed_configs.txt ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "No config files changed — skip"
+          fi
+
+      # Fix 3: loop từng file thay vì truyền file list
+      - name: Run Checkov on changed files
+        if: steps.config-check.outputs.changed == 'true'
+        run: |
+          pip install checkov
+          # Reset output file
+          echo '{"runs":[]}' > checkov-pr.sarif
+
+          while IFS= read -r file; do
+            if [ -f "$file" ]; then
+              echo "Scanning: $file"
+              checkov \
+                -f "$file" \
+                --output sarif \
+                --output-file-path /tmp/checkov-tmp.sarif \
+                --soft-fail \
+                || true
+
+              # Merge kết quả nếu có
+              if [ -f "/tmp/checkov-tmp.sarif" ]; then
+                cp /tmp/checkov-tmp.sarif checkov-pr.sarif
+              fi
+            fi
+          done < changed_configs.txt
+
+      - name: Upload Checkov SARIF
+        if: steps.config-check.outputs.changed == 'true'
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: checkov-pr.sarif
+          category: checkov-pr
+
+      - name: Save config results
+        if: steps.config-check.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: config-pr-${{ github.sha }}
+          path: checkov-pr.sarif
+
+  dependency-scan:
+    name: "Dependency Scan (pip-audit)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Fix 1: fetch develop
+      - name: Fetch develop branch
+        run: git fetch origin develop
+
+      - name: Check if dependency files changed
+        id: dep-changed
+        run: |
+          CHANGED=$(git diff --name-only origin/develop...HEAD \
+            | grep -E 'pyproject\.toml|poetry\.lock' || true)
+          if [ -n "$CHANGED" ]; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+            echo "Changed: $CHANGED"
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+            echo "No dependency files changed — skip"
+          fi
+
+      # Fix 11: cache pip
+      - name: Setup Python
+        if: steps.dep-changed.outputs.changed == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # Fix 4: --only main thay vì --without dev
+      - name: Export requirements
+        if: steps.dep-changed.outputs.changed == 'true'
+        run: |
+          pip install poetry==1.8.3
+          poetry export \
+            -f requirements.txt \
+            --output requirements-pr.txt \
+            --without-hashes \
+            --only main
+
+      - name: Run pip-audit
+        if: steps.dep-changed.outputs.changed == 'true'
+        run: |
+          pip install pip-audit
+          pip-audit \
+            -r requirements-pr.txt \
+            --format=json \
+            --output=pip-audit-pr.json \
+            || true
+
+      - name: Save results
+        if: steps.dep-changed.outputs.changed == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: dep-pr-${{ github.sha }}
+          path: pip-audit-pr.json
+
+  library-scan:
+    name: "Library Scan (pip-audit)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fix 11: cache pip
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      # Fix 4: --only main
+      - name: Export + scan libraries
+        run: |
+          pip install poetry==1.8.3 pip-audit
+          poetry export \
+            -f requirements.txt \
+            --output requirements-lib.txt \
+            --without-hashes \
+            --only main
+
+          pip-audit \
+            -r requirements-lib.txt \
+            --format=json \
+            --output=library-scan-pr.json \
+            || true
+
+      - name: Save results
+        uses: actions/upload-artifact@v4
+        with:
+          name: lib-pr-${{ github.sha }}
+          path: library-scan-pr.json
+
+  gate:
+    name: "Gate PR Scan"
+    runs-on: ubuntu-latest
+    needs: [sast, config-scan, dependency-scan, library-scan]
+    if: always()
+    steps:
+      - name: Download all results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-pr-${{ github.sha }}"
+          merge-multiple: true
+          path: ./results
+        continue-on-error: true
+
+      - name: Evaluate gate
+        run: |
+          echo "## 🔍 PR Scan Gate" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+
+          BLOCK=0
+
+          # Check job results
+          for name_result in \
+            "SAST:${{ needs.sast.result }}" \
+            "Config Scan:${{ needs.config-scan.result }}" \
+            "Dependency Scan:${{ needs.dependency-scan.result }}" \
+            "Library Scan:${{ needs.library-scan.result }}"; do
+            name="${name_result%%:*}"
+            result="${name_result##*:}"
+            if [[ "$result" == "failure" ]]; then
+              echo "| $name | ❌ FAILED |" >> $GITHUB_STEP_SUMMARY
+              ((BLOCK++))
+            else
+              echo "| $name | ✅ PASSED |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+          # Fix 5: parse pip-audit JSON đúng format (list, không phải dict)
+          CRITICAL_DEP=0
+          for f in \
+            ./results/pip-audit-pr.json \
+            ./results/library-scan-pr.json; do
+            if [ -f "$f" ]; then
+              COUNT=$(python3 -c "
+                import json, sys
+                try:
+                    data = json.load(open('$f'))
+                    # pip-audit output là list
+                    if isinstance(data, list):
+                        vulns = sum(len(dep.get('vulns', [])) for dep in data)
+                    # hoặc dict với key dependencies
+                    elif isinstance(data, dict):
+                        vulns = sum(len(dep.get('vulns', []))
+                                    for dep in data.get('dependencies', []))
+                    else:
+                        vulns = 0
+                    print(vulns)
+                except Exception as e:
+                    print(0)
+                ")
+              CRITICAL_DEP=$((CRITICAL_DEP + COUNT))
+            fi
+          done
+
+          # Parse SAST critical từ SARIF
+          CRITICAL_SAST=0
+          if [ -f "./results/semgrep.sarif" ]; then
+            CRITICAL_SAST=$(python3 -c "
+              import json
+              try:
+                  data = json.load(open('./results/semgrep.sarif'))
+                  errors = sum(1 for run in data.get('runs', [])
+                              for r in run.get('results', [])
+                              if r.get('level') == 'error')
+                  print(errors)
+              except:
+                  print(0)
+              ")
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Findings" >> $GITHUB_STEP_SUMMARY
+          echo "- SAST Critical: **${CRITICAL_SAST}**" >> $GITHUB_STEP_SUMMARY
+          echo "- Dependency CVEs: **${CRITICAL_DEP}**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Fix 7: gate thật sự block dựa trên findings
+          if [[ "${BLOCK}" -gt 0 ]] || \
+             [[ "${CRITICAL_SAST}" -gt 0 ]] || \
+             [[ "${CRITICAL_DEP}" -gt 0 ]]; then
+            echo "### ❌ Block Merge" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "### ✅ Allow Merge" >> $GITHUB_STEP_SUMMARY
+          fi

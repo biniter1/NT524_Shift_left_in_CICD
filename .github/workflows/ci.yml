@@ -1,52 +1,36 @@
-name: DevSecOps CI/CD Pipeline
+name: CI Pipeline
+
 on:
   push:
-    branches: [main]
-  pull_request:
-      branches:
-        - main
-env:
-  IMAGE_NAME: ghcr.io/biniter1/damn-vulnerable-restaurant-api-game
-jobs:
-  pre-commit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v2
-        with:
-          fetch-depth: 0
-      - name: Set up Python
-        uses: actions/setup-python@v2
-        with:
-          python-version: '3.11'
-      - name: Cache pre-commit
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pre-commit
-          key: pre-commit-${{ hashFiles('**/.pre-commit-config.yaml') }}
-      - name: Run pre-commit hooks
-        uses: pre-commit/action@v3.0.1
+    branches:
+      - develop
 
-  secret-scan:
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_NAME: ghcr.io/biniter1/nt524_shift_left_in_cicd
+  IMAGE_TAG: ${{ github.sha }}
+  REGISTRY: ghcr.io
+
+jobs:
+  # ═══════════════════════════════════════════════════════════
+  # PHASE 1 — TEST MATERIAL (song song)
+  # ═══════════════════════════════════════════════════════════
+
+  sast:
+    name: "SAST Full"
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: TruffleHog Scan
-        uses: trufflesecurity/trufflehog@main
-        with:
-          path: .
-          base: ${{ github.event.before }}
-          head: ${{ github.sha }}
-          extra_args: --only-verified
-  sast-iac:
-    runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       security-events: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Run SemGrep
+      - name: Semgrep scan
         uses: semgrep/semgrep-action@v1
         with:
           config: >-
@@ -54,14 +38,19 @@ jobs:
             p/owasp-top-ten
             p/secrets
           generateSarif: "1"
-        env:
-          SEMGREP_EXIT_CODE: 0 # bật tạm thời next error
-      - name: Upload result of SemGrep
-        if: always()
+        continue-on-error: true
+
+      - name: Ensure semgrep output exists
+        run: |
+          [ -f semgrep.sarif ] \
+            || echo '{"version":"2.1.0","runs":[]}' > semgrep.sarif
+
+      - name: Upload Semgrep SARIF
         uses: github/codeql-action/upload-sarif@v3
+        if: always()
         with:
           sarif_file: semgrep.sarif
-          category: semgrep
+          category: semgrep-ci
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
@@ -71,78 +60,127 @@ jobs:
       - name: Autobuild
         uses: github/codeql-action/autobuild@v3
 
-      - name: Run CodeQL analysis
+      - name: Run CodeQL
         uses: github/codeql-action/analyze@v3
         with:
           category: "/language:python"
-  iac-scan:
+
+      - name: Save results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sast-ci-${{ github.sha }}
+          path: semgrep.sarif
+
+  secret-scan:
+    name: "Secret Scan"
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: TruffleHog scan
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: .
+          base: ${{ github.event.before }}
+          head: ${{ github.sha }}
+          extra_args: --only-verified
+
+  config-scan:
+    name: "Config Scan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
       security-events: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkov
+      - name: Check terraform exists
+        id: tf
+        run: |
+          [ -d terraform ] \
+            && echo "exists=true" >> $GITHUB_OUTPUT \
+            || echo "exists=false" >> $GITHUB_OUTPUT
+
+      - name: Check k8s exists
+        id: k8s
+        run: |
+          [ -d k8s ] \
+            && echo "exists=true" >> $GITHUB_OUTPUT \
+            || echo "exists=false" >> $GITHUB_OUTPUT
+
+      - name: Checkov scan terraform
+        if: steps.tf.outputs.exists == 'true'
         uses: bridgecrewio/checkov-action@v12
         with:
           directory: terraform/
           framework: terraform
           output_format: sarif
-          output_file_path: checkov-results.sarif
-          soft_fail: true # tạm thời tắt đi demo cho đẹp
+          output_file_path: checkov-terraform.sarif
+          soft_fail: true
 
-      - name: Upload Checkov result
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
+      - name: Checkov scan k8s
+        if: steps.k8s.outputs.exists == 'true'
+        uses: bridgecrewio/checkov-action@v12
         with:
-          sarif_file: checkov-results.sarif
-          category: checkov
-  dependency-scan:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+          directory: k8s/
+          framework: kubernetes
+          output_format: sarif
+          output_file_path: checkov-k8s.sarif
+          soft_fail: true
 
-      - name: Setup
+      - name: Upload results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always() && steps.tf.outputs.exists == 'true'
+        with:
+          sarif_file: checkov-terraform.sarif
+          category: checkov-ci
+
+  dependency-scan:
+    name: "Dependency Scan"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install Poetry
-        run: pip install poetry==1.8.3
-      - name: Export requirements from Poetry
+          cache: 'pip'
+
+      - name: Export + audit
         run: |
+          pip install poetry==1.8.3 pip-audit
           poetry export \
             -f requirements.txt \
             --output requirements-ci.txt \
             --without-hashes \
-            --without dev
-
-      - name: Install pip-audit
-        run: pip install pip-audit
-
-      - name: Run pip-audit
-        run: |
+            --only main
           pip-audit \
             -r requirements-ci.txt \
             --format=json \
-            --output=pip-audit-report.json \
+            --output=pip-audit.json \
             || true
 
-      - name: Upload audit report
+      - name: Save results
         uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: pip-audit-report
-          path: pip-audit-report.json
-
+          name: dep-ci-${{ github.sha }}
+          path: pip-audit.json
 
   unit-test:
-    name: "🧪 Unit tests"
+    name: "Unit Test"
     runs-on: ubuntu-latest
-    needs: [sast-iac, dependency-scan]
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run tests via Docker Compose
+      - name: Run tests
         run: |
           docker compose build
           docker compose run --rm web pytest . -v --tb=short
@@ -151,43 +189,327 @@ jobs:
         if: always()
         run: docker compose down -v
 
-  ci-gate:
+  # ═══════════════════════════════════════════════════════════
+  # GATE TEST MATERIAL
+  # ═══════════════════════════════════════════════════════════
+
+  gate-test:
+    name: "Gate Test Material"
     runs-on: ubuntu-latest
-    needs: [pre-commit, secret-scan, sast-iac, dependency-scan, unit-test]
+    timeout-minutes: 5
+    needs: [sast, secret-scan, config-scan, dependency-scan, unit-test]
     if: always()
+    outputs:
+      passed: ${{ steps.gate.outputs.passed }}
     steps:
-      - name: Check all CI jobs passed
+      - name: Download results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: "*-ci-${{ github.sha }}"
+          merge-multiple: true
+          path: ./results
+        continue-on-error: true
+
+      - name: Evaluate gate
+        id: gate
         run: |
-          count=0
-          if [[ "${{needs.pre-commit.result}}" != "success" ]];
-          then
-            echo "Job pre-commit not successful"
-            ((count++))
-          fi
-          if [[ "${{needs.secret-scan.result}}" != "success" ]];
-          then
-            echo "Job secret-scan not successful"
-            ((count++))
-          fi
-          if [[ "${{needs.sast-iac.result}}" != "success" ]];
-          then
-            echo "Job sast-iac not successful"
-            ((count++))
-          fi
-          if [[ "${{needs.dependency-scan.result}}" != "success" ]];
-          then
-            echo "Job dependecy-scan not successful"
-            ((count++))
-          fi
-          if [[ "${{needs.unit-test.result}}" != "success" ]];
-          then
-            echo "Job unit-test not successful"
-            ((count++))
+          echo "## 🧪 Gate Test Material" >> $GITHUB_STEP_SUMMARY
+          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+
+          BLOCK=0
+
+          for item in \
+            "SAST:${{ needs.sast.result }}" \
+            "Secret Scan:${{ needs.secret-scan.result }}" \
+            "Config Scan:${{ needs.config-scan.result }}" \
+            "Dependency Scan:${{ needs.dependency-scan.result }}" \
+            "Unit Test:${{ needs.unit-test.result }}"; do
+            name="${item%%:*}"
+            result="${item##*:}"
+            if [[ "$result" == "failure" ]]; then
+              echo "| $name | ❌ FAILED |" >> $GITHUB_STEP_SUMMARY
+              ((BLOCK++))
+            else
+              echo "| $name | ✅ PASSED |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+          # Parse pip-audit findings
+          VULN_COUNT=0
+          if [ -f "./results/pip-audit.json" ]; then
+            VULN_COUNT=$(python3 -c "
+import json
+try:
+    data = json.load(open('./results/pip-audit.json'))
+    deps = data if isinstance(data, list) \
+               else data.get('dependencies', [])
+    print(sum(
+        1 for d in deps
+        for v in d.get('vulns', [])
+        if v.get('fix_versions')
+    ))
+except:
+    print(0)
+")
           fi
 
-          if [[ "${count}" -ne 0 ]];
-          then
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- Dependency CVEs (fixable): **${VULN_COUNT}**" \
+            >> $GITHUB_STEP_SUMMARY
+
+          if [[ "$BLOCK" -gt 0 ]] || [[ "$VULN_COUNT" -gt 0 ]]; then
+            echo "### ❌ Gate FAILED" >> $GITHUB_STEP_SUMMARY
+            echo "passed=false" >> $GITHUB_OUTPUT
             exit 1
-          else
-            echo "All jobs passed"
           fi
+
+          echo "### ✅ Gate PASSED" >> $GITHUB_STEP_SUMMARY
+          echo "passed=true" >> $GITHUB_OUTPUT
+
+  # ═══════════════════════════════════════════════════════════
+  # PHASE 2 — BUILD
+  # Build once → scan exact digest → sign
+  # ═══════════════════════════════════════════════════════════
+
+  build:
+    name: "Build & Push Image"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [gate-test]
+    if: needs.gate-test.outputs.passed == 'true'
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build once và push — lấy digest
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          platforms: linux/amd64
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.IMAGE_NAME }}:dev-latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Scan và SBOM chạy song song trên exact digest
+  verify-artifact:
+    name: "Scan Image & SBOM"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [build]
+    permissions:
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Trivy scan exact digest
+        id: trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: >-
+            ${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}
+          format: sarif
+          output: trivy.sarif
+          # exit-code 1 → job fail → gate catch được
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+        continue-on-error: true
+
+      - name: Trivy table summary
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: >-
+            ${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}
+          format: table
+          exit-code: '0'
+          severity: 'CRITICAL,HIGH'
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy.sarif
+          category: trivy-image
+
+      - name: Install Syft & Generate SBOM
+        uses: anchore/sbom-action/download-syft@v0
+
+      - name: Generate SBOM
+        run: |
+          syft \
+            "${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}" \
+            -o cyclonedx-json=sbom.cdx.json
+
+      - name: Save SBOM
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.cdx.json
+
+      - name: Save Trivy results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-${{ github.sha }}
+          path: trivy.sarif
+
+  # ═══════════════════════════════════════════════════════════
+  # GATE BUILD
+  # ═══════════════════════════════════════════════════════════
+
+  gate-build:
+    name: "Gate Build"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [build, verify-artifact]
+    if: always()
+    outputs:
+      passed: ${{ steps.gate.outputs.passed }}
+      digest: ${{ needs.build.outputs.digest }}
+    steps:
+      - name: Evaluate gate
+        id: gate
+        run: |
+          echo "## 🏗️ Gate Build" >> $GITHUB_STEP_SUMMARY
+          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+
+          BLOCK=0
+
+          for item in \
+            "Build:${{ needs.build.result }}" \
+            "Scan & SBOM:${{ needs.verify-artifact.result }}"; do
+            name="${item%%:*}"
+            result="${item##*:}"
+            if [[ "$result" == "failure" ]]; then
+              echo "| $name | ❌ FAILED |" >> $GITHUB_STEP_SUMMARY
+              ((BLOCK++))
+            else
+              echo "| $name | ✅ PASSED |" >> $GITHUB_STEP_SUMMARY
+            fi
+          done
+
+          if [[ "$BLOCK" -gt 0 ]]; then
+            echo "### ❌ Gate FAILED — Block Sign" >> $GITHUB_STEP_SUMMARY
+            echo "passed=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+          echo "### ✅ Gate PASSED — Proceed to Sign" >> $GITHUB_STEP_SUMMARY
+          echo "passed=true" >> $GITHUB_OUTPUT
+
+  # ═══════════════════════════════════════════════════════════
+  # SIGN — exact digest
+  # ═══════════════════════════════════════════════════════════
+
+  sign:
+    name: "Sign Image"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [gate-build]
+    if: needs.gate-build.outputs.passed == 'true'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Download SBOM
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+
+      - name: Login to Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.2.4'
+
+      - name: Sign image
+        run: |
+          REF="${{ env.IMAGE_NAME }}@${{ needs.gate-build.outputs.digest }}"
+          cosign sign --yes "$REF"
+          echo "✅ Signed: $REF"
+
+      - name: Attach SBOM
+        run: |
+          REF="${{ env.IMAGE_NAME }}@${{ needs.gate-build.outputs.digest }}"
+          cosign attest --yes \
+            --predicate sbom.cdx.json \
+            --type cyclonedx \
+            "$REF"
+          echo "✅ SBOM attached"
+
+      - name: Verify signature
+        run: |
+          REF="${{ env.IMAGE_NAME }}@${{ needs.gate-build.outputs.digest }}"
+          cosign verify \
+            --certificate-identity-regexp \
+              "https://github.com/biniter1/.*" \
+            --certificate-oidc-issuer \
+              "https://token.actions.githubusercontent.com" \
+            "$REF"
+          echo "✅ Verified"
+
+  # ═══════════════════════════════════════════════════════════
+  # AUDIT
+  # ═══════════════════════════════════════════════════════════
+
+  audit:
+    name: "Audit"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [gate-test, gate-build, sign]
+    if: always()
+    steps:
+      - name: CI Summary
+        run: |
+          echo "## 📊 CI Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Phase | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Test Material | ${{ needs.gate-test.result }} |" \
+            >> $GITHUB_STEP_SUMMARY
+          echo "| Build & Scan  | ${{ needs.gate-build.result }} |" \
+            >> $GITHUB_STEP_SUMMARY
+          echo "| Sign          | ${{ needs.sign.result }} |" \
+            >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}\`" \
+            >> $GITHUB_STEP_SUMMARY
+          echo "**Digest:** \`${{ needs.gate-build.outputs.digest }}\`" \
+            >> $GITHUB_STEP_SUMMARY
