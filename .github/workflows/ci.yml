@@ -71,7 +71,7 @@ jobs:
         with:
           name: sast-ci-${{ github.sha }}
           path: semgrep.sarif
-
+    continue-on-error: true
   secret-scan:
     name: "Secret Scan"
     runs-on: ubuntu-latest
@@ -140,6 +140,7 @@ jobs:
         with:
           sarif_file: checkov-terraform.sarif
           category: checkov-ci
+    continue-on-error: true
 
   dependency-scan:
     name: "Dependency Scan"
@@ -174,6 +175,7 @@ jobs:
         with:
           name: dep-ci-${{ github.sha }}
           path: pip-audit.json
+    continue-on-error: true
 
   unit-test:
     name: "Unit Test"
@@ -190,6 +192,7 @@ jobs:
       - name: Cleanup
         if: always()
         run: docker compose down -v
+    continue-on-error: true
 
   # ═══════════════════════════════════════════════════════════
   # GATE TEST MATERIAL
@@ -268,6 +271,7 @@ jobs:
 
           echo "### ✅ Gate PASSED" >> $GITHUB_STEP_SUMMARY
           echo "passed=true" >> $GITHUB_OUTPUT
+
 
   # ═══════════════════════════════════════════════════════════
   # PHASE 2 — BUILD
@@ -393,8 +397,10 @@ jobs:
     name: "Gate Build"
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [build, verify-artifact]
-    if: always()
+    needs: [gate-test,build, verify-artifact]
+    if: >-
+      always() &&
+      needs.gate-test.outputs.passed == 'true'
     outputs:
       passed: ${{ steps.gate.outputs.passed }}
       digest: ${{ needs.build.outputs.digest }}
@@ -438,8 +444,10 @@ jobs:
     name: "Sign Image"
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [gate-build]
-    if: needs.gate-build.outputs.passed == 'true'
+    needs: [gate-test,gate-build]
+    if: >-
+        needs.gate-test.outputs.passed == 'true' &&
+        needs.gate-build.outputs.passed == 'true'
     permissions:
       contents: read
       packages: write
