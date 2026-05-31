@@ -90,32 +90,68 @@ jobs:
           fi
 
       # Fix 3: loop từng file thay vì truyền file list
-      - name: Run Checkov on changed files
+      - name: Run Checkov on changed configs
         if: steps.config-check.outputs.changed == 'true'
         run: |
           pip install checkov
-          # Reset output file
-          echo '{"runs":[]}' > checkov-pr.sarif
 
-          while IFS= read -r file; do
-            if [ -f "$file" ]; then
-              echo "Scanning: $file"
-              checkov \
-                -f "$file" \
-                --output sarif \
-                --output-file-path /tmp/checkov-tmp.sarif \
-                --soft-fail \
-                || true
+          TARGETS=""
 
-              # Merge kết quả nếu có
-              if [ -f "/tmp/checkov-tmp.sarif" ]; then
-                cp /tmp/checkov-tmp.sarif checkov-pr.sarif
-              fi
-            fi
-          done < changed_configs.txt
+          if grep -q '^terraform/' changed_configs.txt; then
+            TARGETS="$TARGETS -d terraform"
+          fi
 
-      - name: Upload Checkov SARIF
+          if grep -q '^k8s/' changed_configs.txt; then
+            TARGETS="$TARGETS -d k8s"
+          fi
+
+          if grep -q '^ansible/' changed_configs.txt; then
+            TARGETS="$TARGETS -d ansible"
+          fi
+
+          if [ -z "$TARGETS" ]; then
+            echo "No valid config directory found"
+            echo '{"version":"2.1.0","runs":[]}' > checkov-pr.sarif
+            exit 0
+          fi
+
+          checkov $TARGETS \
+            --output sarif \
+            --output-file-path checkov-pr.sarif \
+            --soft-fail \
+            || true
+
+          echo "Generated SARIF:"
+          ls -lh checkov-pr.sarif || true
+      - name: Check Checkov SARIF has runs
+        id: checkov-sarif
         if: steps.config-check.outputs.changed == 'true'
+        run: |
+          if [ ! -f checkov-pr.sarif ]; then
+            echo "valid=false" >> $GITHUB_OUTPUT
+            echo "checkov-pr.sarif not found"
+            exit 0
+          fi
+
+          RUNS=$(python3 - <<'PY'
+            import json
+            try:
+                data = json.load(open("checkov-pr.sarif"))
+                print(len(data.get("runs", [])))
+            except Exception:
+                print(0)
+            PY
+            )
+
+          echo "SARIF runs: $RUNS"
+
+          if [ "$RUNS" -gt 0 ]; then
+            echo "valid=true" >> $GITHUB_OUTPUT
+          else
+            echo "valid=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Upload Checkov SARIF
+        if: steps.config-check.outputs.changed == 'true' && steps.checkov-sarif.outputs.valid == 'true'
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: checkov-pr.sarif
