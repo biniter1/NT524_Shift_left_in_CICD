@@ -486,7 +486,7 @@ jobs:
     name: "Sign Image"
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [gate-test,gate-build]
+    needs: [gate-test, gate-build, build, verify-artifact]
     if: >-
         needs.gate-test.outputs.passed == 'true' &&
         needs.gate-build.outputs.passed == 'true'
