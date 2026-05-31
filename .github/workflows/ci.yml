@@ -45,9 +45,30 @@ jobs:
           [ -f semgrep.sarif ] \
             || echo '{"version":"2.1.0","runs":[]}' > semgrep.sarif
 
+      - name: Check Semgrep SARIF has runs
+        id: semgrep_sarif
+        run: |
+          RUNS=$(python3 <<'PY'
+            import json
+
+            try:
+                data = json.load(open("semgrep.sarif", "r", encoding="utf-8"))
+                print(len(data.get("runs", [])))
+            except Exception:
+                print(0)
+            PY
+            )
+
+          echo "runs=$RUNS"
+          if [ "$RUNS" -gt 0 ]; then
+            echo "valid=true" >> $GITHUB_OUTPUT
+          else
+            echo "valid=false" >> $GITHUB_OUTPUT
+          fi
+
       - name: Upload Semgrep SARIF
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        if: steps.semgrep_sarif.outputs.valid == 'true'
         with:
           sarif_file: semgrep.sarif
           category: semgrep-ci
@@ -134,13 +155,19 @@ jobs:
           soft_fail: true
         continue-on-error: true
 
-      - name: Upload results
-        uses: github/codeql-action/upload-sarif@v3
-        if: always() && steps.tf.outputs.exists == 'true'
+      - name: Upload Checkov Terraform SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        if: steps.tf.outputs.exists == 'true' && hashFiles('checkov-terraform.sarif') != ''
         with:
           sarif_file: checkov-terraform.sarif
-          category: checkov-ci
-    continue-on-error: true
+          category: checkov-terraform-ci
+
+      - name: Upload Checkov K8s SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        if: steps.k8s.outputs.exists == 'true' && hashFiles('checkov-k8s.sarif') != ''
+        with:
+          sarif_file: checkov-k8s.sarif
+          category: checkov-k8s-ci
 
   dependency-scan:
     name: "Dependency Scan"
@@ -157,7 +184,7 @@ jobs:
 
       - name: Export + audit
         run: |
-          pip install poetry==1.8.3 pip-audit
+          pip install poetry==1.8.3 poetry-plugin-export pip-audit
           poetry export \
             -f requirements.txt \
             --output requirements-ci.txt \
@@ -232,36 +259,51 @@ jobs:
             "Unit Test:${{ needs.unit-test.result }}"; do
             name="${item%%:*}"
             result="${item##*:}"
+
             if [[ "$result" == "failure" ]]; then
               echo "| $name | ❌ FAILED |" >> $GITHUB_STEP_SUMMARY
-              ((BLOCK++))
+              BLOCK=$((BLOCK + 1))
             else
               echo "| $name | ✅ PASSED |" >> $GITHUB_STEP_SUMMARY
             fi
           done
 
-          # Parse pip-audit findings
           VULN_COUNT=0
+
           if [ -f "./results/pip-audit.json" ]; then
-            VULN_COUNT=$(python3 -c "
-              import json
-              try:
-                  data = json.load(open('./results/pip-audit.json'))
-                  deps = data if isinstance(data, list) \
-                            else data.get('dependencies', [])
-                  print(sum(
-                      1 for d in deps
-                      for v in d.get('vulns', [])
-                      if v.get('fix_versions')
-                  ))
-              except:
-                  print(0)
-              ")
+            VULN_COUNT=$(python3 <<'PY'
+          import json
+
+          try:
+              with open("./results/pip-audit.json", "r", encoding="utf-8") as fp:
+                  data = json.load(fp)
+
+              if isinstance(data, list):
+                  deps = data
+              elif isinstance(data, dict):
+                  deps = data.get("dependencies", [])
+              else:
+                  deps = []
+
+              count = sum(
+                  1
+                  for dep in deps
+                  for vuln in dep.get("vulns", [])
+                  if vuln.get("fix_versions")
+              )
+
+              print(count)
+          except Exception:
+              print(0)
+          PY
+          )
           fi
 
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- Dependency CVEs (fixable): **${VULN_COUNT}**" \
-            >> $GITHUB_STEP_SUMMARY
+          echo "- Dependency CVEs (fixable): **${VULN_COUNT}**" >> $GITHUB_STEP_SUMMARY
+
+          echo "BLOCK=${BLOCK}"
+          echo "VULN_COUNT=${VULN_COUNT}"
 
           if [[ "$BLOCK" -gt 0 ]] || [[ "$VULN_COUNT" -gt 0 ]]; then
             echo "### ❌ Gate FAILED" >> $GITHUB_STEP_SUMMARY
