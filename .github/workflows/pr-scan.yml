@@ -338,103 +338,160 @@ jobs:
               if not os.path.exists(path):
                   return None
               try:
-                  with open(path) as f:
+                  with open(path, encoding="utf-8") as f:
                       return json.load(f)
               except Exception as e:
                   print(f"[WARN] Cannot parse {path}: {e}")
                   return None
 
           def write(line=""):
-              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
                   f.write(line + "\n")
+
+          def as_list(value):
+              return value if isinstance(value, list) else []
+
+          def as_dict(value):
+              return value if isinstance(value, dict) else {}
 
           artifacts_dir = "./artifacts"
 
           # ── Đường dẫn các report ────────────────────────────
-          # actions/download-artifact@v4 tạo subfolder theo tên artifact
           semgrep_path   = f"{artifacts_dir}/semgrep-report/semgrep.json"
           gitleaks_path  = f"{artifacts_dir}/secret-scan-report/gitleaks.json"
           pip_audit_path = f"{artifacts_dir}/dependency-report/pip-audit.json"
           checkov_path   = f"{artifacts_dir}/checkov-report/checkov.json"
 
-          # ── Parse Semgrep ────────────────────────────────────
+          # ── Parse Semgrep ───────────────────────────────────
           semgrep_data     = load_json(semgrep_path)
           semgrep_missing  = semgrep_data is None
           semgrep_total    = 0
-          semgrep_errors   = 0   # severity ERROR = block trigger
+          semgrep_errors   = 0
           semgrep_warnings = 0
+          semgrep_results  = []
 
-          if semgrep_data:
-              results = semgrep_data.get("results", [])
-              semgrep_total = len(results)
-              for r in results:
-                  sev = r.get("extra", {}).get("severity", "").upper()
-                  if sev == "ERROR":
+          if isinstance(semgrep_data, dict):
+              semgrep_results = as_list(semgrep_data.get("results", []))
+              semgrep_total = len(semgrep_results)
+
+              for r in semgrep_results:
+                  if not isinstance(r, dict):
+                      continue
+                  extra = as_dict(r.get("extra", {}))
+                  sev = str(extra.get("severity", "")).upper()
+                  if sev in ("ERROR", "HIGH"):
                       semgrep_errors += 1
-                  elif sev in ("WARNING", "WARN"):
+                  elif sev in ("WARNING", "WARN", "MEDIUM"):
                       semgrep_warnings += 1
 
-          # ── Parse Gitleaks ───────────────────────────────────
+          # ── Parse Gitleaks ──────────────────────────────────
           gitleaks_data    = load_json(gitleaks_path)
           gitleaks_missing = gitleaks_data is None
           secret_count     = 0
+          leaks            = []
 
-          if gitleaks_data:
-              if isinstance(gitleaks_data, list):
-                  secret_count = len(gitleaks_data)
-              # Một số version trả dict với key "leaks"
-              elif isinstance(gitleaks_data, dict):
-                  secret_count = len(gitleaks_data.get("leaks", []))
+          if isinstance(gitleaks_data, list):
+              leaks = [x for x in gitleaks_data if isinstance(x, dict)]
+          elif isinstance(gitleaks_data, dict):
+              raw_leaks = gitleaks_data.get("leaks", [])
+              leaks = [x for x in as_list(raw_leaks) if isinstance(x, dict)]
 
-          # ── Parse pip-audit ──────────────────────────────────
-          pip_data         = load_json(pip_audit_path)
-          pip_missing      = pip_data is None
-          pip_skipped      = isinstance(pip_data, dict) and pip_data.get("_skipped")
-          pip_vuln_total   = 0
-          pip_vuln_pkgs    = []
+          secret_count = len(leaks)
+
+          # ── Parse pip-audit ─────────────────────────────────
+          pip_data       = load_json(pip_audit_path)
+          pip_missing    = pip_data is None
+          pip_skipped    = isinstance(pip_data, dict) and pip_data.get("_skipped")
+          pip_vuln_total = 0
+          pip_vuln_pkgs  = []
+          pip_deps       = []
 
           if pip_data and not pip_skipped:
-              # pip-audit JSON: list of {name, version, vulns:[...]}
-              deps = pip_data if isinstance(pip_data, list) \
-                    else pip_data.get("dependencies", [])
-              for dep in deps:
-                  vulns = dep.get("vulns", [])
-                  if vulns:
-                      pip_vuln_total += len(vulns)
-                      pip_vuln_pkgs.append(
-                          f"{dep.get('name','?')}=={dep.get('version','?')} "
-                          f"({len(vulns)} CVE)"
-                      )
+              if isinstance(pip_data, list):
+                  pip_deps = pip_data
+              elif isinstance(pip_data, dict):
+                  deps_value = pip_data.get("dependencies", [])
+                  pip_deps = deps_value if isinstance(deps_value, list) else []
+              else:
+                  pip_deps = []
 
-          # ── Parse Checkov ────────────────────────────────────
+              for dep in pip_deps:
+                  if not isinstance(dep, dict):
+                      continue
+
+                  vulns = dep.get("vulns", [])
+                  if not isinstance(vulns, list):
+                      vulns = []
+
+                  if vulns:
+                      name = dep.get("name", "?")
+                      version = dep.get("version", "?")
+                      pip_vuln_total += len(vulns)
+                      pip_vuln_pkgs.append({
+                          "name": name,
+                          "version": version,
+                          "vulns": [v for v in vulns if isinstance(v, dict)]
+                      })
+
+          # ── Parse Checkov ───────────────────────────────────
           checkov_data     = load_json(checkov_path)
           checkov_missing  = checkov_data is None
           checkov_skipped  = isinstance(checkov_data, dict) and checkov_data.get("_skipped")
           checkov_failed   = 0
           checkov_passed   = 0
+          failed_checks    = []
+
+          def collect_checkov(obj):
+              passed = []
+              failed = []
+
+              if isinstance(obj, dict):
+                  results = obj.get("results", {})
+
+                  if isinstance(results, dict):
+                      passed_items = results.get("passed_checks", [])
+                      failed_items = results.get("failed_checks", [])
+
+                      if isinstance(passed_items, list):
+                          passed.extend([x for x in passed_items if isinstance(x, dict)])
+                      if isinstance(failed_items, list):
+                          failed.extend([x for x in failed_items if isinstance(x, dict)])
+
+                  elif isinstance(results, list):
+                      for item in results:
+                          p, f = collect_checkov(item)
+                          passed.extend(p)
+                          failed.extend(f)
+
+              elif isinstance(obj, list):
+                  for item in obj:
+                      p, f = collect_checkov(item)
+                      passed.extend(p)
+                      failed.extend(f)
+
+              return passed, failed
 
           if checkov_data and not checkov_skipped:
-              results = checkov_data.get("results", {})
-              checkov_failed = len(results.get("failed_checks", []))
-              checkov_passed = len(results.get("passed_checks", []))
+              passed_checks, failed_checks = collect_checkov(checkov_data)
+              checkov_passed = len(passed_checks)
+              checkov_failed = len(failed_checks)
 
-          # ── Job results từ env (inject bên dưới) ─────────────
+          # ── Job results từ env ──────────────────────────────
           job_results = {
-              "sast_scan"        : os.environ.get("SAST_RESULT", "unknown"),
-              "secret_scan"      : os.environ.get("SECRET_RESULT", "unknown"),
-              "dependency_scan"  : os.environ.get("DEP_RESULT", "unknown"),
-              "iac_config_scan"  : os.environ.get("IAC_RESULT", "unknown"),
+              "sast_scan"       : os.environ.get("SAST_RESULT", "unknown"),
+              "secret_scan"     : os.environ.get("SECRET_RESULT", "unknown"),
+              "dependency_scan" : os.environ.get("DEP_RESULT", "unknown"),
+              "iac_config_scan" : os.environ.get("IAC_RESULT", "unknown"),
           }
 
-          # ── Gate Policy ──────────────────────────────────────
-          # Điều chỉnh threshold này theo nhu cầu project/demo
-          CHECKOV_BLOCK_THRESHOLD = 5   # Block nếu failed checks >= threshold
+          # ── Gate Policy ─────────────────────────────────────
+          CHECKOV_BLOCK_THRESHOLD = 5
           block_reasons = []
 
           if semgrep_missing:
               block_reasons.append("Semgrep report không tồn tại — scanner có thể bị lỗi")
           elif semgrep_errors > 0:
-              block_reasons.append(f"Semgrep phát hiện {semgrep_errors} finding mức ERROR")
+              block_reasons.append(f"Semgrep phát hiện {semgrep_errors} finding mức ERROR/HIGH")
 
           if gitleaks_missing:
               block_reasons.append("Gitleaks report không tồn tại — scanner có thể bị lỗi")
@@ -456,21 +513,22 @@ jobs:
 
           should_block = len(block_reasons) > 0
 
-          # ── Ghi GitHub Step Summary ──────────────────────────
+          # ── Ghi GitHub Step Summary ─────────────────────────
           write("# 🔍 PR Scan — Gate Report")
           write()
 
-          # Bảng trạng thái job
           write("## Job Status")
           write()
           write("| Job | Runner Result |")
           write("|-----|--------------|")
+
           job_labels = {
               "sast_scan"       : "SAST (Semgrep)",
               "secret_scan"     : "Secret Scan (Gitleaks)",
               "dependency_scan" : "Dependency Scan (pip-audit)",
               "iac_config_scan" : "IaC/Config Scan (Checkov)",
           }
+
           for key, label in job_labels.items():
               r = job_results[key]
               if r == "success":
@@ -482,64 +540,67 @@ jobs:
               write(f"| {label} | {icon} {r} |")
 
           write()
-
-          # ── Findings detail ──────────────────────────────────
           write("## Findings")
           write()
 
-          # Semgrep
+          # ── Semgrep summary ─────────────────────────────────
           write("### 🔎 SAST — Semgrep")
           if semgrep_missing:
               write("> ⚠️ Report không tìm thấy")
           else:
               write(f"- Tổng findings : **{semgrep_total}**")
-              write(f"- Mức ERROR     : **{semgrep_errors}** ← block trigger")
-              write(f"- Mức WARNING   : **{semgrep_warnings}**")
-              # Top-5 findings để dễ debug/demo
-              if semgrep_data and semgrep_data.get("results"):
+              write(f"- Mức ERROR/HIGH: **{semgrep_errors}** ← block trigger")
+              write(f"- Mức WARNING/MEDIUM: **{semgrep_warnings}**")
+
+              if semgrep_results:
                   write("")
                   write("<details><summary>Top findings (tối đa 5)</summary>")
                   write("")
                   write("| Severity | Rule | File | Message |")
                   write("|----------|------|------|---------|")
-                  for r in semgrep_data["results"][:5]:
-                      sev  = r.get("extra", {}).get("severity", "?")
-                      rule = r.get("check_id", "?").split(".")[-1]   # rút gọn rule ID
+
+                  for r in semgrep_results[:5]:
+                      if not isinstance(r, dict):
+                          continue
+                      extra = as_dict(r.get("extra", {}))
+                      sev  = extra.get("severity", "?")
+                      rule = str(r.get("check_id", "?")).split(".")[-1]
                       path = r.get("path", "?")
-                      line = r.get("start", {}).get("line", "")
-                      msg  = r.get("extra", {}).get("message", "")[:80]
+                      line = as_dict(r.get("start", {})).get("line", "")
+                      msg  = str(extra.get("message", ""))[:80]
                       loc  = f"{path}:{line}" if line else path
                       write(f"| `{sev}` | `{rule}` | `{loc}` | {msg} |")
+
                   write("")
                   write("</details>")
           write()
 
-          # Gitleaks
+          # ── Gitleaks summary ────────────────────────────────
           write("### 🔑 Secret Scan — Gitleaks")
           if gitleaks_missing:
               write("> ⚠️ Report không tìm thấy")
           else:
               write(f"- Secrets phát hiện : **{secret_count}**")
-              # Top-5 secrets (che giá trị thật, chỉ hiện file/rule)
-              leaks = gitleaks_data if isinstance(gitleaks_data, list) \
-                      else gitleaks_data.get("leaks", [])
+
               if leaks:
                   write("")
-                  write("<details><summary>Top secrets (tối đa 5)</summary>")
+                  write("<details><summary>Top secrets (tối đa 5, không hiện giá trị secret)</summary>")
                   write("")
                   write("| Rule | File | Line | Commit |")
                   write("|------|------|------|--------|")
+
                   for leak in leaks[:5]:
                       rule   = leak.get("RuleID", leak.get("rule", "?"))
-                      fpath  = leak.get("File",   leak.get("file", "?"))
+                      fpath  = leak.get("File", leak.get("file", "?"))
                       lineno = leak.get("StartLine", leak.get("line", "?"))
                       commit = str(leak.get("Commit", leak.get("commit", "?")))[:8]
                       write(f"| `{rule}` | `{fpath}` | {lineno} | `{commit}` |")
+
                   write("")
                   write("</details>")
           write()
 
-          # pip-audit
+          # ── pip-audit summary ───────────────────────────────
           write("### 📦 Dependency Scan — pip-audit")
           if pip_missing:
               write("> ⚠️ Report không tìm thấy")
@@ -547,30 +608,28 @@ jobs:
               write("> ℹ️ Skipped — không có requirements file")
           else:
               write(f"- Vulnerabilities : **{pip_vuln_total}**")
+
               if pip_vuln_pkgs:
                   write("- Packages bị ảnh hưởng:")
-                  for pkg in pip_vuln_pkgs:
-                      write(f"  - `{pkg}`")
-                  # Chi tiết CVE (top 5 package đầu, mỗi package 3 CVE)
-                  deps = pip_data if isinstance(pip_data, list) \
-                         else pip_data.get("dependencies", [])
-                  vuln_deps = [d for d in deps if d.get("vulns")]
-                  if vuln_deps:
+                  for dep in pip_vuln_pkgs:
+                      write(f"  - `{dep['name']}=={dep['version']} ({len(dep['vulns'])} CVE)`")
+
+                  write("")
+                  write("<details><summary>Chi tiết CVE (tối đa 5 package)</summary>")
+                  write("")
+
+                  for dep in pip_vuln_pkgs[:5]:
+                      write(f"**`{dep['name']}=={dep['version']}`**")
+                      for v in dep["vulns"][:3]:
+                          vid = v.get("id", "?")
+                          desc = str(v.get("description", v.get("fix_versions", "")))[:100]
+                          write(f"- `{vid}`: {desc}")
                       write("")
-                      write("<details><summary>Chi tiết CVE (tối đa 5 package)</summary>")
-                      write("")
-                      for dep in vuln_deps[:5]:
-                          write(f"**{dep.get('name')}=={dep.get('version')}**")
-                          for v in dep["vulns"][:3]:
-                              vid  = v.get("id", "?")
-                              desc = v.get("description", v.get("fix_versions", ""))
-                              desc = str(desc)[:100]
-                              write(f"- `{vid}`: {desc}")
-                          write("")
-                      write("</details>")
+
+                  write("</details>")
           write()
 
-          # Checkov
+          # ── Checkov summary ─────────────────────────────────
           write("### 🏗️ IaC/Config Scan — Checkov")
           if checkov_missing:
               write("> ⚠️ Report không tìm thấy")
@@ -578,30 +637,32 @@ jobs:
               write("> ℹ️ Skipped — không có file IaC/config")
           else:
               write(f"- Passed checks : **{checkov_passed}**")
-              write(f"- Failed checks : **{checkov_failed}**"
-                    f" (block threshold: {CHECKOV_BLOCK_THRESHOLD})")
-              # Top-5 failed checks
-              failed_checks = checkov_data.get("results", {}).get("failed_checks", [])
+              write(f"- Failed checks : **{checkov_failed}** "
+                    f"(block threshold: {CHECKOV_BLOCK_THRESHOLD})")
+
               if failed_checks:
                   write("")
                   write("<details><summary>Top failed checks (tối đa 5)</summary>")
                   write("")
                   write("| Check ID | Check Name | File | Lines |")
                   write("|----------|------------|------|-------|")
+
                   for c in failed_checks[:5]:
                       cid   = c.get("check_id", "?")
-                      cname = c.get("check_name", "?")[:60]
+                      cname = str(c.get("check_name", "?"))[:60]
                       fpath = c.get("file_path", "?")
                       lines = c.get("file_line_range", ["?", "?"])
-                      lines_str = f"{lines[0]}-{lines[1]}" if isinstance(lines, list) else str(lines)
+                      lines_str = f"{lines[0]}-{lines[1]}" if isinstance(lines, list) and len(lines) >= 2 else str(lines)
                       write(f"| `{cid}` | {cname} | `{fpath}` | {lines_str} |")
+
                   write("")
                   write("</details>")
           write()
 
-          # ── Kết luận Gate ────────────────────────────────────
+          # ── Kết luận Gate ───────────────────────────────────
           write("---")
           write()
+
           if should_block:
               write("## ❌ Block Merge")
               write()
@@ -617,9 +678,9 @@ jobs:
 
           write()
           write("---")
-          write(f"*Artifacts được lưu 30 ngày để dùng làm audit evidence.*")
+          write("*Artifacts được lưu 30 ngày để dùng làm audit evidence.*")
 
-          # ── Exit code ────────────────────────────────────────
+          # ── Exit code ───────────────────────────────────────
           if should_block:
               print("\n❌ GATE: Block Merge")
               for r in block_reasons:
