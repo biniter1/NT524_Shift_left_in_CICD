@@ -63,10 +63,18 @@ jobs:
 
           echo "Resolving digest for: $IMAGE_TAG_REF"
 
-          # Lấy đúng image index / manifest list digest.
-          # Đây là digest khớp với Docker Buildx output trong CI và digest đã được Cosign ký.
-          DIGEST=$(docker buildx imagetools inspect "$IMAGE_TAG_REF" \
-            --format '{{.Digest}}' 2>/dev/null || true)
+          # Cách 1: dùng docker buildx imagetools inspect và parse dòng Digest
+          docker buildx imagetools inspect "$IMAGE_TAG_REF" \
+            > reports/imagetools-raw.txt 2>&1 || true
+
+          DIGEST=$(awk '/^Digest:/ {print $2; exit}' reports/imagetools-raw.txt || true)
+
+          # Cách 2 fallback: parse từ output có khoảng trắng đầu dòng
+          if [ -z "$DIGEST" ]; then
+            DIGEST=$(grep -E "^[[:space:]]*Digest:" reports/imagetools-raw.txt \
+              | head -1 \
+              | awk '{print $2}' || true)
+          fi
 
           if [ -n "$DIGEST" ]; then
             echo "$DIGEST" > reports/image-digest.txt
@@ -76,6 +84,8 @@ jobs:
             echo "N/A" > reports/image-digest.txt
             echo "digest_status=failed" > reports/inspect-status.txt
             echo "WARNING: Could not resolve image digest"
+            echo "===== imagetools raw output ====="
+            cat reports/imagetools-raw.txt || true
           fi
 
           {
