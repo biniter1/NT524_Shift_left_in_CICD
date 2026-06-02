@@ -1,3 +1,10 @@
+# ============================================================
+# CI Pipeline — Layer 3: CI Build & Artifact Security
+# Mindset: Scanner/Test tạo evidence → Gate tổng hợp →
+#          Gate quyết định → Build → Artifact scan → Artifact Gate → Sign
+# Trigger: push vào develop (sau khi PR Scan đã chạy lúc merge)
+# ============================================================
+
 name: CI Pipeline
 
 on:
@@ -11,81 +18,60 @@ concurrency:
 
 env:
   IMAGE_NAME: ghcr.io/biniter1/nt524_shift_left_in_cicd
-  IMAGE_TAG: ${{ github.sha }}
-  REGISTRY: ghcr.io
+  REGISTRY:   ghcr.io
+
+# ============================================================
+# PHASE 1 — Full Security & Test Scan (song song)
+# Scanner KHÔNG fail pipeline. Mỗi job phải tạo report.
+# ============================================================
 
 jobs:
-  # ═══════════════════════════════════════════════════════════
-  # PHASE 1 — TEST MATERIAL (song song)
-  # ═══════════════════════════════════════════════════════════
 
-  sast:
-    name: "SAST Full"
+  # ----------------------------------------------------------
+  # A. SAST — Semgrep full scan (không baseline, đây là CI)
+  # ----------------------------------------------------------
+  sast_scan:
+    name: "SAST (Semgrep)"
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    permissions:
-      security-events: write
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Semgrep scan
-        uses: semgrep/semgrep-action@v1
-        with:
-          config: >-
-            p/python
-            p/owasp-top-ten
-            p/secrets
-          generateSarif: "1"
-        continue-on-error: true
+      - name: Install Semgrep
+        run: pip install semgrep --quiet
 
-      - name: Ensure semgrep output exists
+      - name: Run Semgrep — xuất JSON
+        # Semgrep exit 1 khi có finding → || true để không fail job
         run: |
-          [ -f semgrep.sarif ] \
-            || echo '{"version":"2.1.0","runs":[]}' > semgrep.sarif
+          mkdir -p reports
+          semgrep \
+            --config p/python \
+            --config p/owasp-top-ten \
+            --config p/secrets \
+            --json \
+            --output reports/semgrep.json \
+            . \
+            || true
 
-      - name: Check Semgrep SARIF has runs
-        id: semgrep_sarif
-        run: |
-          
-          RUNS=$(python3 -c 'import json; data=json.load(open("semgrep.sarif")); print(len(data.get("runs", [])))' || echo 0)
-          echo "runs=$RUNS"
-          if [ "$RUNS" -gt 0 ]; then
-            echo "valid=true" >> $GITHUB_OUTPUT
-          else
-            echo "valid=false" >> $GITHUB_OUTPUT
-          fi
+          # Đảm bảo file tồn tại dù semgrep không scan được gì
+          [ -f reports/semgrep.json ] \
+            || echo '{"results":[],"errors":[],"paths":{}}' > reports/semgrep.json
 
-      - name: Upload Semgrep SARIF
-        uses: github/codeql-action/upload-sarif@v4
-        if: steps.semgrep_sarif.outputs.valid == 'true'
-        with:
-          sarif_file: semgrep.sarif
-          category: semgrep-ci
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: python
-
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
-
-      - name: Run CodeQL
-        uses: github/codeql-action/analyze@v3
-        with:
-          category: "/language:python"
-
-      - name: Save results
-        uses: actions/upload-artifact@v4
+      - name: Upload artifact — semgrep-report
         if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: sast-ci-${{ github.sha }}
-          path: semgrep.sarif
-    continue-on-error: true
-  secret-scan:
-    name: "Secret Scan"
+          name: semgrep-report
+          path: reports/semgrep.json
+          retention-days: 30
+
+  # ----------------------------------------------------------
+  # B. Secret Scan — Gitleaks (Docker, ổn định hơn binary)
+  # ----------------------------------------------------------
+  secret_scan:
+    name: "Secret Scan (Gitleaks)"
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -93,75 +79,36 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: TruffleHog scan
-        uses: trufflesecurity/trufflehog@main
-        with:
-          path: .
-          base: ${{ github.event.before }}
-          head: ${{ github.sha }}
-          extra_args: --only-verified
-
-  config-scan:
-    name: "Config Scan"
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      security-events: write
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Check terraform exists
-        id: tf
+      - name: Run Gitleaks — scan toàn bộ repo
+        # CI scan full repo develop, không chỉ diff như PR scan
+        # exit code 1 = found secrets → || true
         run: |
-          [ -d terraform ] \
-            && echo "exists=true" >> $GITHUB_OUTPUT \
-            || echo "exists=false" >> $GITHUB_OUTPUT
+          mkdir -p reports
+          docker run --rm \
+            -v "$PWD:/repo" \
+            ghcr.io/gitleaks/gitleaks:latest detect \
+              --source=/repo \
+              --report-format=json \
+              --report-path=/repo/reports/gitleaks.json \
+            || true
 
-      - name: Check k8s exists
-        id: k8s
-        run: |
-          [ -d k8s ] \
-            && echo "exists=true" >> $GITHUB_OUTPUT \
-            || echo "exists=false" >> $GITHUB_OUTPUT
+          # Gitleaks không tạo file nếu không có finding
+          [ -f reports/gitleaks.json ] \
+            || echo '[]' > reports/gitleaks.json
 
-      - name: Checkov scan terraform
-        if: steps.tf.outputs.exists == 'true'
-        uses: bridgecrewio/checkov-action@v12
+      - name: Upload artifact — secret-scan-report
+        if: always()
+        uses: actions/upload-artifact@v4
         with:
-          directory: terraform/
-          framework: terraform
-          output_format: sarif
-          output_file_path: checkov-terraform.sarif
-          soft_fail: true
-        continue-on-error: true
+          name: secret-scan-report
+          path: reports/gitleaks.json
+          retention-days: 30
 
-      - name: Checkov scan k8s
-        if: steps.k8s.outputs.exists == 'true'
-        uses: bridgecrewio/checkov-action@v12
-        with:
-          directory: k8s/
-          framework: kubernetes
-          output_format: sarif
-          output_file_path: checkov-k8s.sarif
-          soft_fail: true
-        continue-on-error: true
-
-      - name: Upload Checkov Terraform SARIF
-        uses: github/codeql-action/upload-sarif@v4
-        if: steps.tf.outputs.exists == 'true' && hashFiles('checkov-terraform.sarif') != ''
-        with:
-          sarif_file: checkov-terraform.sarif
-          category: checkov-terraform-ci
-
-      - name: Upload Checkov K8s SARIF
-        uses: github/codeql-action/upload-sarif@v4
-        if: steps.k8s.outputs.exists == 'true' && hashFiles('checkov-k8s.sarif') != ''
-        with:
-          sarif_file: checkov-k8s.sarif
-          category: checkov-k8s-ci
-
-  dependency-scan:
-    name: "Dependency Scan"
+  # ----------------------------------------------------------
+  # C. Dependency Scan — pip-audit
+  # ----------------------------------------------------------
+  dependency_scan:
+    name: "Dependency Scan (pip-audit)"
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -170,128 +117,515 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
+          cache: "pip"
 
-      - name: Export + audit
+      - name: Export requirements & run pip-audit
         run: |
-          pip install poetry==1.8.3 poetry-plugin-export pip-audit
-          poetry export \
-            -f requirements.txt \
-            --output requirements-ci.txt \
-            --without-hashes \
-            --only main
-          pip-audit \
-            -r requirements-ci.txt \
-            --format=json \
-            --output=pip-audit.json \
-            || true
+          mkdir -p reports
+          pip install poetry==1.8.3 pip-audit --quiet
 
-      - name: Save results
-        uses: actions/upload-artifact@v4
+          # Thử poetry export trước, fallback sang requirements.txt
+          if [ -f pyproject.toml ]; then
+            poetry export \
+              -f requirements.txt \
+              --output reports/requirements.txt \
+              --without-hashes \
+              --only main \
+              || true
+          fi
+
+          if [ ! -s reports/requirements.txt ] && [ -f requirements.txt ]; then
+            cp requirements.txt reports/requirements.txt
+          fi
+
+          if [ ! -s reports/requirements.txt ]; then
+            echo "No requirements — skipping pip-audit"
+            echo '{"dependencies":[],"_skipped":true}' > reports/pip-audit.json
+          else
+            pip-audit \
+              -r reports/requirements.txt \
+              --format json \
+              --output reports/pip-audit.json \
+              || true
+            [ -f reports/pip-audit.json ] \
+              || echo '{"dependencies":[]}' > reports/pip-audit.json
+          fi
+
+      - name: Upload artifact — dependency-report
         if: always()
+        uses: actions/upload-artifact@v4
         with:
-          name: dep-ci-${{ github.sha }}
-          path: pip-audit.json
-    continue-on-error: true
+          name: dependency-report
+          path: reports/pip-audit.json
+          retention-days: 30
 
-  unit-test:
-    name: "Unit Test"
+  # ----------------------------------------------------------
+  # D. IaC/Config Scan — Checkov full repo
+  # ----------------------------------------------------------
+  iac_config_scan:
+    name: "IaC/Config Scan (Checkov)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Checkov
+        run: pip install checkov --quiet
+
+      - name: Detect IaC/config files
+        id: detect
+        run: |
+          FILES=$(find . \
+            -not -path './.git/*' \
+            -not -path './node_modules/*' \
+            \( -name "*.tf" -o -name "*.tfvars" \
+               -o -name "*.yml" -o -name "*.yaml" \
+               -o -name "Dockerfile" \) \
+            2>/dev/null | head -100 || true)
+          [ -n "$FILES" ] \
+            && echo "has_files=true"  >> $GITHUB_OUTPUT \
+            || echo "has_files=false" >> $GITHUB_OUTPUT
+
+      - name: Run Checkov — scan toàn bộ repo
+        run: |
+          mkdir -p reports
+
+          if [ "${{ steps.detect.outputs.has_files }}" == "true" ]; then
+            checkov \
+              --directory . \
+              --output json \
+              --output-file-path reports/ \
+              --soft-fail \
+              --quiet \
+              || true
+
+            # Checkov tạo results_json.json trong output-file-path
+            if [ -f reports/results_json.json ]; then
+              mv reports/results_json.json reports/checkov.json
+            else
+              echo '{"results":{"passed_checks":[],"failed_checks":[]},"_note":"no output"}' \
+                > reports/checkov.json
+            fi
+          else
+            echo '{"results":{"passed_checks":[],"failed_checks":[]},"_skipped":true}' \
+              > reports/checkov.json
+          fi
+
+      - name: Upload artifact — checkov-report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: checkov-report
+          path: reports/checkov.json
+          retention-days: 30
+
+  # ----------------------------------------------------------
+  # E. Unit Test — pytest với JUnit XML report
+  # ----------------------------------------------------------
+  unit_test:
+    name: "Unit Test (pytest)"
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run tests
+      - name: Build test image
+        run: docker compose build
+        # Build fail là lỗi infra, vẫn tiếp tục để tạo marker
+        continue-on-error: true
+
+      - name: Run pytest — xuất JUnit XML
+        # || true để job không fail; gate sẽ parse XML để biết kết quả
+        # Chạy mkdir -p reports trong container trước pytest để đảm bảo path tồn tại
+        # Giả sử docker-compose.yml mount project vào /app (working dir container)
         run: |
-          docker compose build
-          docker compose run --rm web pytest . -v --tb=short
+          mkdir -p reports
+          docker compose run --rm web \
+            sh -c "mkdir -p reports && pytest . -v --tb=short --junit-xml=reports/pytest.xml" \
+            || true
+
+          # Nếu không tạo được XML (docker compose fail hoặc mount sai),
+          # tạo marker XML bằng base64 decode để tránh ký tự XML làm lỗi YAML parser
+          if [ ! -f reports/pytest.xml ]; then
+            echo 'PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0idXRmLTgiPz4KPHRlc3RzdWl0ZXM+CiAgPHRlc3RzdWl0ZSBuYW1lPSJweXRlc3QiIHRlc3RzPSIxIiBmYWlsdXJlcz0iMSIgZXJyb3JzPSIwIj4KICAgIDx0ZXN0Y2FzZSBuYW1lPSJkb2NrZXJfY29tcG9zZV9idWlsZF9vcl9ydW5fZmFpbGVkIj4KICAgICAgPGZhaWx1cmUgbWVzc2FnZT0iZG9ja2VyIGNvbXBvc2UgYnVpbGQvcnVuIGZhaWxlZCAtLS0gbm8gdGVzdCByZXN1bHRzIGF2YWlsYWJsZSIvPgogICAgPC90ZXN0Y2FzZT4KICA8L3Rlc3RzdWl0ZT4KPC90ZXN0c3VpdGVzPgo=' \
+              | base64 -d > reports/pytest.xml
+            echo "Created marker pytest.xml (docker compose failed)"
+          fi
 
       - name: Cleanup
         if: always()
-        run: docker compose down -v
-    continue-on-error: true
+        run: docker compose down -v || true
 
-  # ═══════════════════════════════════════════════════════════
-  # GATE TEST MATERIAL
-  # ═══════════════════════════════════════════════════════════
+      - name: Upload artifact — unit-test-report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: reports/pytest.xml
+          retention-days: 30
 
-  gate-test:
-    name: "Gate Test Material"
+
+# ============================================================
+# PHASE 2 — Security & Test Gate
+# Nơi DUY NHẤT có thể fail pipeline ở phase 1.
+# Nếu fail → không build image.
+# ============================================================
+
+  security_test_gate:
+    name: "Security & Test Gate"
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    needs: [sast, secret-scan, config-scan, dependency-scan, unit-test]
+    timeout-minutes: 10
+    needs: [sast_scan, secret_scan, dependency_scan, iac_config_scan, unit_test]
     if: always()
     outputs:
       passed: ${{ steps.gate.outputs.passed }}
     steps:
-      - name: Download results
+      - name: Download tất cả scan artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: "*-ci-${{ github.sha }}"
-          merge-multiple: true
-          path: ./results
+          path: ./artifacts
         continue-on-error: true
 
-      - name: Evaluate gate
+      - name: Parse reports & quyết định Gate
         id: gate
         run: |
-          echo "## 🧪 Gate Test Material" >> $GITHUB_STEP_SUMMARY
-          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          python3 << 'PYTHON_SCRIPT'
+          import json, os, sys, xml.etree.ElementTree as ET
 
-          BLOCK=0
+          CHECKOV_BLOCK_THRESHOLD = 5  # Điều chỉnh theo nhu cầu
 
-          for item in \
-            "SAST:${{ needs.sast.result }}" \
-            "Secret Scan:${{ needs.secret-scan.result }}" \
-            "Config Scan:${{ needs.config-scan.result }}" \
-            "Dependency Scan:${{ needs.dependency-scan.result }}" \
-            "Unit Test:${{ needs.unit-test.result }}"; do
-            name="${item%%:*}"
-            result="${item##*:}"
+          def load_json(path):
+              if not os.path.exists(path):
+                  return None
+              try:
+                  return json.load(open(path))
+              except Exception as e:
+                  print(f"[WARN] Cannot parse {path}: {e}")
+                  return None
 
-            if [[ "$result" == "failure" ]]; then
-              echo "| $name | ❌ FAILED |" >> $GITHUB_STEP_SUMMARY
-              BLOCK=$((BLOCK + 1))
-            else
-              echo "| $name | ✅ PASSED |" >> $GITHUB_STEP_SUMMARY
-            fi
-          done
+          def write(line=""):
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write(line + "\n")
 
-          VULN_COUNT=0
+          def set_output(key, val):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"{key}={val}\n")
 
-          if [ -f "./results/pip-audit.json" ]; then
-            RUNS=$(python3 -c 'import json; data=json.load(open("semgrep.sarif")); print(len(data.get("runs", [])))' || echo 0)
-          fi
+          art = "./artifacts"
+          semgrep_path  = f"{art}/semgrep-report/semgrep.json"
+          gitleaks_path = f"{art}/secret-scan-report/gitleaks.json"
+          pip_path      = f"{art}/dependency-report/pip-audit.json"
+          checkov_path  = f"{art}/checkov-report/checkov.json"
+          pytest_path   = f"{art}/unit-test-report/pytest.xml"
 
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- Dependency CVEs (fixable): **${VULN_COUNT}**" >> $GITHUB_STEP_SUMMARY
+          # ── Parse Semgrep ──────────────────────────────────
+          sg     = load_json(semgrep_path)
+          sg_missing = sg is None
+          sg_total = sg_errors = sg_warnings = 0
+          sg_top   = []
+          if sg:
+              results = sg.get("results", [])
+              sg_total = len(results)
+              for r in results:
+                  sev = r.get("extra", {}).get("severity", "").upper()
+                  if sev in ("ERROR", "HIGH"):
+                      sg_errors += 1
+                  elif sev in ("WARNING", "WARN", "MEDIUM"):
+                      sg_warnings += 1
+                  sg_top.append(r)
 
-          echo "BLOCK=${BLOCK}"
-          echo "VULN_COUNT=${VULN_COUNT}"
+          # ── Parse Gitleaks ─────────────────────────────────
+          gl    = load_json(gitleaks_path)
+          gl_missing = gl is None
+          leaks = []
+          if isinstance(gl, list):
+              leaks = gl
+          elif isinstance(gl, dict):
+              leaks = gl.get("leaks", [])
+          secret_count = len(leaks)
 
-          if [[ "$BLOCK" -gt 0 ]] || [[ "$VULN_COUNT" -gt 0 ]]; then
-            echo "### ❌ Gate FAILED" >> $GITHUB_STEP_SUMMARY
-            echo "passed=false" >> $GITHUB_OUTPUT
-            exit 1
-          fi
+          # ── Parse pip-audit ────────────────────────────────
+          pip    = load_json(pip_path)
+          pip_missing = pip is None
+          pip_skipped = isinstance(pip, dict) and pip.get("_skipped")
+          pip_vuln_total = 0
+          pip_vuln_pkgs  = []
+          pip_deps = []
+          if pip and not pip_skipped:
+              pip_deps = pip if isinstance(pip, list) else pip.get("dependencies", [])
+              for dep in pip_deps:
+                  v = dep.get("vulns", [])
+                  if v:
+                      pip_vuln_total += len(v)
+                      pip_vuln_pkgs.append(dep)
 
-          echo "### ✅ Gate PASSED" >> $GITHUB_STEP_SUMMARY
-          echo "passed=true" >> $GITHUB_OUTPUT
+          # ── Parse Checkov ──────────────────────────────────
+          ck    = load_json(checkov_path)
+          ck_missing  = ck is None
+          ck_skipped  = isinstance(ck, dict) and ck.get("_skipped")
+          ck_failed = ck_passed = 0
+          ck_failed_checks = []
+          if ck and not ck_skipped:
+              r = ck.get("results", {})
+              ck_failed_checks = r.get("failed_checks", [])
+              ck_failed = len(ck_failed_checks)
+              ck_passed = len(r.get("passed_checks", []))
+
+          # ── Parse pytest XML ───────────────────────────────
+          pytest_missing = not os.path.exists(pytest_path)
+          pytest_failed  = False
+          pytest_tests = pytest_failures = pytest_errors = 0
+          if not pytest_missing:
+              try:
+                  tree = ET.parse(pytest_path)
+                  root = tree.getroot()
+                  # root có thể là <testsuites> hoặc <testsuite>
+                  if root.tag == "testsuites":
+                      suites = root.findall("testsuite")
+                  else:
+                      suites = [root]
+                  for suite in suites:
+                      pytest_tests    += int(suite.get("tests",    0))
+                      pytest_failures += int(suite.get("failures", 0))
+                      pytest_errors   += int(suite.get("errors",   0))
+                  pytest_failed = (pytest_failures + pytest_errors) > 0
+              except Exception as e:
+                  print(f"[WARN] Cannot parse pytest XML: {e}")
+                  pytest_failed = True
+
+          # ── Job results từ env ─────────────────────────────
+          job_results = {
+              "sast_scan"        : os.environ.get("SAST_RESULT",   "unknown"),
+              "secret_scan"      : os.environ.get("SECRET_RESULT", "unknown"),
+              "dependency_scan"  : os.environ.get("DEP_RESULT",    "unknown"),
+              "iac_config_scan"  : os.environ.get("IAC_RESULT",    "unknown"),
+              "unit_test"        : os.environ.get("TEST_RESULT",   "unknown"),
+          }
+
+          # ── Gate Policy ────────────────────────────────────
+          block_reasons = []
+
+          if sg_missing:
+              block_reasons.append("Semgrep report bị thiếu")
+          elif sg_errors > 0:
+              block_reasons.append(f"Semgrep phát hiện {sg_errors} finding mức ERROR/HIGH")
+
+          if gl_missing:
+              block_reasons.append("Gitleaks report bị thiếu")
+          elif secret_count > 0:
+              block_reasons.append(f"Phát hiện {secret_count} secret bị lộ")
+
+          if pip_missing:
+              block_reasons.append("pip-audit report bị thiếu")
+          elif pip_vuln_total > 0:
+              block_reasons.append(f"pip-audit phát hiện {pip_vuln_total} vulnerability")
+
+          if ck_missing:
+              block_reasons.append("Checkov report bị thiếu")
+          elif ck_failed >= CHECKOV_BLOCK_THRESHOLD:
+              block_reasons.append(
+                  f"Checkov có {ck_failed} failed checks (threshold={CHECKOV_BLOCK_THRESHOLD})"
+              )
+
+          if pytest_missing:
+              block_reasons.append("pytest XML report bị thiếu")
+          elif pytest_failed:
+              block_reasons.append(
+                  f"Unit test fail ({pytest_failures} failures, {pytest_errors} errors)"
+              )
+
+          should_block = bool(block_reasons)
+
+          # ── Write Summary ──────────────────────────────────
+          write("# 🔒 Security & Test Gate")
+          write()
+
+          # Bảng job status
+          write("## Job Status")
+          write()
+          write("| Job | Runner | Gate |")
+          write("|-----|--------|------|")
+          job_labels = {
+              "sast_scan"      : "SAST (Semgrep)",
+              "secret_scan"    : "Secret Scan (Gitleaks)",
+              "dependency_scan": "Dependency Scan (pip-audit)",
+              "iac_config_scan": "IaC/Config Scan (Checkov)",
+              "unit_test"      : "Unit Test (pytest)",
+          }
+          for key, label in job_labels.items():
+              r = job_results[key]
+              if r == "success":
+                  runner_icon = "✅"
+              elif r == "skipped":
+                  runner_icon = "⚠️"
+              else:
+                  runner_icon = "❌"
+              write(f"| {label} | {runner_icon} {r} | — |")
+
+          write()
+          write("## Findings")
+          write()
+
+          # Semgrep
+          write("### 🔎 SAST — Semgrep")
+          if sg_missing:
+              write("> ⚠️ Report không tìm thấy")
+          else:
+              write(f"- Tổng findings : **{sg_total}**")
+              write(f"- ERROR/HIGH    : **{sg_errors}** ← block trigger")
+              write(f"- WARNING/MEDIUM: **{sg_warnings}**")
+              if sg_top:
+                  write("")
+                  write("<details><summary>Top findings (tối đa 5)</summary>")
+                  write("")
+                  write("| Severity | Rule | File:Line | Message |")
+                  write("|----------|------|-----------|---------|")
+                  for r in sg_top[:5]:
+                      sev  = r.get("extra", {}).get("severity", "?")
+                      rule = r.get("check_id", "?").split(".")[-1]
+                      path = r.get("path", "?")
+                      line = r.get("start", {}).get("line", "")
+                      msg  = r.get("extra", {}).get("message", "")[:80]
+                      loc  = f"{path}:{line}" if line else path
+                      write(f"| `{sev}` | `{rule}` | `{loc}` | {msg} |")
+                  write("")
+                  write("</details>")
+          write()
+
+          # Gitleaks
+          write("### 🔑 Secret Scan — Gitleaks")
+          if gl_missing:
+              write("> ⚠️ Report không tìm thấy")
+          else:
+              write(f"- Secrets phát hiện : **{secret_count}**")
+              if leaks:
+                  write("")
+                  write("<details><summary>Top secrets — chỉ hiện file/rule, KHÔNG hiện giá trị (tối đa 5)</summary>")
+                  write("")
+                  write("| Rule | File | Line | Commit |")
+                  write("|------|------|------|--------|")
+                  for leak in leaks[:5]:
+                      rule   = leak.get("RuleID",    leak.get("rule",   "?"))
+                      fpath  = leak.get("File",      leak.get("file",   "?"))
+                      lineno = leak.get("StartLine", leak.get("line",   "?"))
+                      commit = str(leak.get("Commit", leak.get("commit","?")))[:8]
+                      # Tuyệt đối không print Secret/Match value
+                      write(f"| `{rule}` | `{fpath}` | {lineno} | `{commit}` |")
+                  write("")
+                  write("</details>")
+          write()
+
+          # pip-audit
+          write("### 📦 Dependency Scan — pip-audit")
+          if pip_missing:
+              write("> ⚠️ Report không tìm thấy")
+          elif pip_skipped:
+              write("> ℹ️ Skipped — không có requirements file")
+          else:
+              write(f"- Vulnerabilities : **{pip_vuln_total}**")
+              if pip_vuln_pkgs:
+                  write("")
+                  write("<details><summary>Packages có CVE (tối đa 5)</summary>")
+                  write("")
+                  for dep in pip_vuln_pkgs[:5]:
+                      write(f"**`{dep.get('name')}=={dep.get('version')}`**")
+                      for v in dep.get("vulns", [])[:3]:
+                          vid  = v.get("id", "?")
+                          desc = str(v.get("description", v.get("fix_versions", "")))[:100]
+                          write(f"- `{vid}`: {desc}")
+                      write("")
+                  write("</details>")
+          write()
+
+          # Checkov
+          write("### 🏗️ IaC/Config Scan — Checkov")
+          if ck_missing:
+              write("> ⚠️ Report không tìm thấy")
+          elif ck_skipped:
+              write("> ℹ️ Skipped — không có file IaC/config")
+          else:
+              write(f"- Passed checks : **{ck_passed}**")
+              write(f"- Failed checks : **{ck_failed}** (threshold: {CHECKOV_BLOCK_THRESHOLD})")
+              if ck_failed_checks:
+                  write("")
+                  write("<details><summary>Top failed checks (tối đa 5)</summary>")
+                  write("")
+                  write("| Check ID | Check Name | File | Lines |")
+                  write("|----------|------------|------|-------|")
+                  for c in ck_failed_checks[:5]:
+                      cid   = c.get("check_id",   "?")
+                      cname = c.get("check_name", "?")[:60]
+                      fpath = c.get("file_path",  "?")
+                      lines = c.get("file_line_range", ["?", "?"])
+                      ls    = f"{lines[0]}-{lines[1]}" if isinstance(lines, list) else str(lines)
+                      write(f"| `{cid}` | {cname} | `{fpath}` | {ls} |")
+                  write("")
+                  write("</details>")
+          write()
+
+          # pytest
+          write("### 🧪 Unit Test — pytest")
+          if pytest_missing:
+              write("> ⚠️ Report không tìm thấy")
+          else:
+              status = "❌ FAILED" if pytest_failed else "✅ PASSED"
+              write(f"- Status   : **{status}**")
+              write(f"- Tests    : **{pytest_tests}**")
+              write(f"- Failures : **{pytest_failures}**")
+              write(f"- Errors   : **{pytest_errors}**")
+          write()
+
+          # Kết luận
+          write("---")
+          write()
+          if should_block:
+              write("## ❌ Block — Không build image")
+              write()
+              write("Lý do:")
+              for reason in block_reasons:
+                  write(f"- {reason}")
+              write()
+              write("> *Điều chỉnh `CHECKOV_BLOCK_THRESHOLD` trong gate script nếu cần.*")
+              set_output("passed", "false")
+          else:
+              write("## ✅ Allow — Tiến hành build image")
+              set_output("passed", "true")
+
+          write()
+          write("---")
+          write("*Evidence artifacts lưu 30 ngày cho audit.*")
+
+          if should_block:
+              print("\n❌ GATE FAILED:")
+              for r in block_reasons:
+                  print(f"  - {r}")
+              sys.exit(1)
+          else:
+              print("\n✅ GATE PASSED — proceeding to build")
+
+          PYTHON_SCRIPT
+
+        env:
+          SAST_RESULT:   ${{ needs.sast_scan.result }}
+          SECRET_RESULT: ${{ needs.secret_scan.result }}
+          DEP_RESULT:    ${{ needs.dependency_scan.result }}
+          IAC_RESULT:    ${{ needs.iac_config_scan.result }}
+          TEST_RESULT:   ${{ needs.unit_test.result }}
 
 
-  # ═══════════════════════════════════════════════════════════
-  # PHASE 2 — BUILD
-  # Build once → scan exact digest → sign
-  # ═══════════════════════════════════════════════════════════
+# ============================================================
+# PHASE 3 — Build Image
+# Chỉ chạy khi security_test_gate pass.
+# ============================================================
 
-  build:
+  build_image:
     name: "Build & Push Image"
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    needs: [gate-test]
-    if: needs.gate-test.outputs.passed == 'true'
+    needs: [security_test_gate]
+    # Điều kiện: gate phải pass (không dùng result == 'success' vì gate có thể exit 1)
+    if: needs.security_test_gate.outputs.passed == 'true'
     permissions:
       contents: read
       packages: write
@@ -303,170 +637,353 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Registry
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build once và push — lấy digest
-      - name: Build and push
+      - name: Build & Push — lấy immutable digest
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
-          push: true
+          file:    ./Dockerfile
+          push:    true
           platforms: linux/amd64
           tags: |
-            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
             ${{ env.IMAGE_NAME }}:dev-latest
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-to:   type=gha,mode=max
+          # build-push-action tự động expose digest qua outputs.digest
 
-  # Scan và SBOM chạy song song trên exact digest
-  verify-artifact:
-    name: "Scan Image & SBOM"
+      - name: Lưu image digest thành artifact
+        run: |
+          mkdir -p reports
+          echo "${{ steps.build.outputs.digest }}" > reports/image-digest.txt
+          echo "Image  : ${{ env.IMAGE_NAME }}:${{ github.sha }}"
+          echo "Digest : ${{ steps.build.outputs.digest }}"
+
+      - name: Upload artifact — image-digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-digest
+          path: reports/image-digest.txt
+          retention-days: 30
+
+
+# ============================================================
+# PHASE 4 — Artifact Evidence
+# Trivy scan + SBOM trên exact digest.
+# Scanner KHÔNG fail job; artifact_gate mới quyết định.
+# ============================================================
+
+  artifact_scan:
+    name: "Artifact Scan (Trivy + SBOM)"
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    needs: [build]
+    timeout-minutes: 20
+    needs: [build_image]
     permissions:
-      security-events: write
+      packages: read
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Login to Registry
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Trivy scan exact digest
-        id: trivy
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: >-
-            ${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}
-          format: sarif
-          output: trivy.sarif
-          # exit-code 1 → job fail → gate catch được
-          exit-code: '1'
-          ignore-unfixed: true
-          vuln-type: 'os,library'
-          severity: 'CRITICAL,HIGH'
-        continue-on-error: true
-
-      - name: Trivy table summary
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: >-
-            ${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}
-          format: table
-          exit-code: '0'
-          severity: 'CRITICAL,HIGH'
-          ignore-unfixed: true
-
-      - name: Upload Trivy SARIF
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: trivy.sarif
-          category: trivy-image
-
-      - name: Install Syft & Generate SBOM
-        uses: anchore/sbom-action/download-syft@v0
-
-      - name: Generate SBOM
+      - name: Run Trivy — scan exact digest, xuất JSON
+        # Không exit-code: '1' tại đây; artifact_gate mới fail
+        # Mount $HOME/.docker để Trivy dùng credentials đã login GHCR
         run: |
-          syft \
-            "${{ env.IMAGE_NAME }}@${{ needs.build.outputs.digest }}" \
-            -o cyclonedx-json=sbom.cdx.json
+          mkdir -p reports
 
-      - name: Save SBOM
+          IMAGE_REF="${{ env.IMAGE_NAME }}@${{ needs.build_image.outputs.digest }}"
+          echo "Scanning: $IMAGE_REF"
+
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$HOME/.docker:/root/.docker:ro" \
+            -v "$PWD/reports:/reports" \
+            aquasec/trivy:latest image \
+              --format json \
+              --output /reports/trivy.json \
+              --ignore-unfixed \
+              --vuln-type os,library \
+              --severity CRITICAL,HIGH,MEDIUM \
+              --no-progress \
+              "$IMAGE_REF" \
+            || true
+
+          [ -f reports/trivy.json ] \
+            || echo '{"Results":[],"_error":"trivy failed to produce output"}' \
+               > reports/trivy.json
+
+      - name: Upload artifact — trivy-report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sbom-${{ github.sha }}
-          path: sbom.cdx.json
+          name: trivy-report
+          path: reports/trivy.json
+          retention-days: 30
 
-      - name: Save Trivy results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: trivy-${{ github.sha }}
-          path: trivy.sarif
-
-  # ═══════════════════════════════════════════════════════════
-  # GATE BUILD
-  # ═══════════════════════════════════════════════════════════
-
-  gate-build:
-    name: "Gate Build"
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    needs: [gate-test,build, verify-artifact]
-    if: >-
-      always() &&
-      needs.gate-test.outputs.passed == 'true'
-    outputs:
-      passed: ${{ steps.gate.outputs.passed }}
-      digest: ${{ needs.build.outputs.digest }}
-    steps:
-      - name: Evaluate gate
-        id: gate
+      - name: Install Syft & generate SBOM
         run: |
-          echo "## 🏗️ Gate Build" >> $GITHUB_STEP_SUMMARY
-          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          # Cài Syft qua official install script
+          curl -sSfL https://raw.githubusercontent.com/anchore/syft/main/install.sh \
+            | sh -s -- -b /usr/local/bin
+          syft --version
 
-          BLOCK=0
+      - name: Generate SBOM — CycloneDX JSON
+        # DOCKER_CONFIG export để Syft dùng credentials đã login GHCR
+        run: |
+          IMAGE_REF="${{ env.IMAGE_NAME }}@${{ needs.build_image.outputs.digest }}"
+          DOCKER_CONFIG="$HOME/.docker" syft "$IMAGE_REF" \
+            -o cyclonedx-json=reports/sbom.cdx.json \
+            || true
 
-          for item in \
-            "Build:${{ needs.build.result }}" \
-            "Scan & SBOM:${{ needs.verify-artifact.result }}"; do
-            name="${item%%:*}"
-            result="${item##*:}"
-            if [[ "$result" == "failure" ]]; then
-              echo "| $name | ❌ FAILED |" >> $GITHUB_STEP_SUMMARY
-              ((BLOCK++))
-            else
-              echo "| $name | ✅ PASSED |" >> $GITHUB_STEP_SUMMARY
-            fi
-          done
+          [ -f reports/sbom.cdx.json ] \
+            || echo '{"bomFormat":"CycloneDX","_error":"syft failed"}' \
+               > reports/sbom.cdx.json
 
-          if [[ "$BLOCK" -gt 0 ]]; then
-            echo "### ❌ Gate FAILED — Block Sign" >> $GITHUB_STEP_SUMMARY
-            echo "passed=false" >> $GITHUB_OUTPUT
-            exit 1
-          fi
+      - name: Upload artifact — sbom-report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-report
+          path: reports/sbom.cdx.json
+          retention-days: 30
 
-          echo "### ✅ Gate PASSED — Proceed to Sign" >> $GITHUB_STEP_SUMMARY
-          echo "passed=true" >> $GITHUB_OUTPUT
+      # ----------------------------------------------------------
+      # SLSA Provenance — placeholder để bổ sung sau
+      # Để enable SLSA Level 2+, uncomment và dùng:
+      #   slsa-github-generator/.github/workflows/generator_container_slsa3.yml
+      # Xem: https://github.com/slsa-framework/slsa-github-generator
+      # ----------------------------------------------------------
+      # - name: Generate SLSA provenance (enterprise extension)
+      #   uses: slsa-framework/slsa-github-generator/.github/workflows/...
 
-  # ═══════════════════════════════════════════════════════════
-  # SIGN — exact digest
-  # ═══════════════════════════════════════════════════════════
 
-  sign:
-    name: "Sign Image"
+# ============================================================
+# PHASE 5 — Artifact Gate
+# Parse Trivy/SBOM/digest → quyết định sign hay block.
+# ============================================================
+
+  artifact_gate:
+    name: "Artifact Gate"
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [gate-test, gate-build, build, verify-artifact]
-    if: >-
-        needs.gate-test.outputs.passed == 'true' &&
-        needs.gate-build.outputs.passed == 'true'
+    needs: [build_image, artifact_scan]
+    if: always() && needs.build_image.result == 'success'
+    outputs:
+      passed: ${{ steps.gate.outputs.passed }}
+      digest: ${{ needs.build_image.outputs.digest }}
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+        continue-on-error: true
+
+      - name: Parse & quyết định Artifact Gate
+        id: gate
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import json, os, sys
+
+          # Policy: block nếu có CRITICAL hoặc HIGH vượt threshold
+          CRITICAL_THRESHOLD = 0   # 0 = zero-tolerance CRITICAL
+          HIGH_THRESHOLD     = 5   # cho phép tối đa 5 HIGH
+
+          def load_json(path):
+              if not os.path.exists(path):
+                  return None
+              try:
+                  return json.load(open(path))
+              except Exception as e:
+                  print(f"[WARN] Cannot parse {path}: {e}")
+                  return None
+
+          def write(line=""):
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write(line + "\n")
+
+          def set_output(key, val):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"{key}={val}\n")
+
+          art = "./artifacts"
+
+          # ── Load reports ───────────────────────────────────
+          trivy_path  = f"{art}/trivy-report/trivy.json"
+          sbom_path   = f"{art}/sbom-report/sbom.cdx.json"
+          digest_path = f"{art}/image-digest/image-digest.txt"
+
+          trivy    = load_json(trivy_path)
+          sbom     = load_json(sbom_path)
+          digest   = None
+          if os.path.exists(digest_path):
+              digest = open(digest_path).read().strip()
+
+          # ── Parse Trivy ────────────────────────────────────
+          trivy_missing  = trivy is None
+          trivy_error    = isinstance(trivy, dict) and trivy.get("_error")
+          critical_count = high_count = medium_count = 0
+          trivy_top_vulns = []
+
+          if trivy and not trivy_error:
+              for result in trivy.get("Results", []):
+                  for vuln in result.get("Vulnerabilities", []):
+                      sev = vuln.get("Severity", "").upper()
+                      if sev == "CRITICAL":
+                          critical_count += 1
+                      elif sev == "HIGH":
+                          high_count += 1
+                      elif sev == "MEDIUM":
+                          medium_count += 1
+                      if sev in ("CRITICAL", "HIGH"):
+                          trivy_top_vulns.append(vuln)
+
+          # ── Gate Policy ────────────────────────────────────
+          block_reasons = []
+
+          if not digest:
+              block_reasons.append("Image digest không tồn tại")
+
+          if trivy_missing or trivy_error:
+              block_reasons.append("Trivy report bị thiếu hoặc lỗi")
+          else:
+              if critical_count > CRITICAL_THRESHOLD:
+                  block_reasons.append(
+                      f"Trivy: {critical_count} CRITICAL vượt threshold ({CRITICAL_THRESHOLD})"
+                  )
+              if high_count > HIGH_THRESHOLD:
+                  block_reasons.append(
+                      f"Trivy: {high_count} HIGH vượt threshold ({HIGH_THRESHOLD})"
+                  )
+
+          sbom_ok = sbom is not None and not (
+              isinstance(sbom, dict) and sbom.get("_error")
+          )
+          if not sbom_ok:
+              block_reasons.append("SBOM không được tạo")
+
+          should_block = bool(block_reasons)
+
+          # ── Write Summary ──────────────────────────────────
+          write("# 🏺 Artifact Gate")
+          write()
+          write("## Job Status")
+          write()
+          write("| Job | Runner Result |")
+          write("|-----|--------------|")
+          scan_result = os.environ.get("ARTIFACT_SCAN_RESULT", "unknown")
+          if scan_result == "success":
+              scan_icon = "✅"
+          elif scan_result == "skipped":
+              scan_icon = "⚠️"
+          else:
+              scan_icon = "❌"
+          write(f"| Artifact Scan (Trivy + SBOM) | {scan_icon} {scan_result} |")
+          write()
+          write("## Image Info")
+          write()
+          write(f"- **Image** : `${{ env.IMAGE_NAME }}:${{ github.sha }}`")
+          write(f"- **Digest**: `{digest or 'N/A'}`")
+          write()
+
+          write("## Trivy Vulnerability Scan")
+          write()
+          if trivy_missing or trivy_error:
+              write("> ⚠️ Trivy report không tìm thấy hoặc bị lỗi")
+          else:
+              write(f"- CRITICAL : **{critical_count}** (threshold: {CRITICAL_THRESHOLD})")
+              write(f"- HIGH     : **{high_count}** (threshold: {HIGH_THRESHOLD})")
+              write(f"- MEDIUM   : **{medium_count}** (informational)")
+              if trivy_top_vulns:
+                  write("")
+                  write("<details><summary>Top CRITICAL/HIGH vulnerabilities (tối đa 5)</summary>")
+                  write("")
+                  write("| Severity | CVE | Package | Installed | Fixed |")
+                  write("|----------|-----|---------|-----------|-------|")
+                  for v in trivy_top_vulns[:5]:
+                      sev     = v.get("Severity",         "?")
+                      cve     = v.get("VulnerabilityID",  "?")
+                      pkg     = v.get("PkgName",          "?")
+                      inst    = v.get("InstalledVersion", "?")
+                      fixed   = v.get("FixedVersion",     "N/A")
+                      write(f"| `{sev}` | `{cve}` | `{pkg}` | {inst} | {fixed} |")
+                  write("")
+                  write("</details>")
+          write()
+
+          write("## SBOM")
+          write()
+          write(f"- SBOM generated: **{'✅ Yes' if sbom_ok else '❌ No'}**")
+          if sbom_ok and isinstance(sbom, dict):
+              comp_count = len(sbom.get("components", []))
+              write(f"- Components    : **{comp_count}**")
+          write()
+
+          write("---")
+          write()
+          if should_block:
+              write("## ❌ Block — Không sign/promote image")
+              write()
+              write("Lý do:")
+              for reason in block_reasons:
+                  write(f"- {reason}")
+              set_output("passed", "false")
+          else:
+              write("## ✅ Allow — Tiến hành sign image")
+              set_output("passed", "true")
+
+          write()
+          write("---")
+          write("*Evidence artifacts lưu 30 ngày.*")
+
+          if should_block:
+              print("\n❌ ARTIFACT GATE FAILED:")
+              for r in block_reasons:
+                  print(f"  - {r}")
+              sys.exit(1)
+          else:
+              print("\n✅ ARTIFACT GATE PASSED — proceeding to sign")
+
+          PYTHON_SCRIPT
+
+        env:
+          IMAGE_NAME:           ${{ env.IMAGE_NAME }}
+          ARTIFACT_SCAN_RESULT: ${{ needs.artifact_scan.result }}
+
+
+# ============================================================
+# PHASE 6 — Sign & Attest
+# Chỉ chạy khi artifact_gate pass.
+# Dùng Cosign keyless (OIDC), ký theo digest.
+# ============================================================
+
+  sign_image:
+    name: "Sign Image (Cosign)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    needs: [build_image, artifact_gate]
+    if: needs.artifact_gate.outputs.passed == 'true'
     permissions:
-      contents: read
-      packages: write
-      id-token: write
+      contents:  read
+      packages:  write
+      id-token:  write   # bắt buộc cho Cosign keyless signing
     steps:
       - name: Download SBOM
         uses: actions/download-artifact@v4
         with:
-          name: sbom-${{ github.sha }}
+          name: sbom-report
+          path: ./sbom
 
-      - name: Login to Registry
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -476,58 +993,133 @@ jobs:
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3
         with:
-          cosign-release: 'v2.2.4'
+          cosign-release: "v2.4.1"
 
-      - name: Sign image
+      - name: Sign image theo digest (keyless OIDC)
         run: |
-          REF="${{ env.IMAGE_NAME }}@${{ needs.gate-build.outputs.digest }}"
-          cosign sign --yes "$REF"
-          echo "✅ Signed: $REF"
+          IMAGE_REF="${{ env.IMAGE_NAME }}@${{ needs.artifact_gate.outputs.digest }}"
+          echo "Signing: $IMAGE_REF"
+          cosign sign --yes "$IMAGE_REF"
+          echo "✅ Image signed"
 
-      - name: Attach SBOM
+      - name: Attest SBOM
         run: |
-          REF="${{ env.IMAGE_NAME }}@${{ needs.gate-build.outputs.digest }}"
+          IMAGE_REF="${{ env.IMAGE_NAME }}@${{ needs.artifact_gate.outputs.digest }}"
           cosign attest --yes \
-            --predicate sbom.cdx.json \
+            --predicate ./sbom/sbom.cdx.json \
             --type cyclonedx \
-            "$REF"
-          echo "✅ SBOM attached"
+            "$IMAGE_REF"
+          echo "✅ SBOM attested"
 
       - name: Verify signature
+        # Verify ngay sau khi ký để chắc chắn signature hợp lệ
         run: |
-          REF="${{ env.IMAGE_NAME }}@${{ needs.gate-build.outputs.digest }}"
+          IMAGE_REF="${{ env.IMAGE_NAME }}@${{ needs.artifact_gate.outputs.digest }}"
           cosign verify \
             --certificate-identity-regexp \
-              "https://github.com/biniter1/.*" \
+              "https://github.com/${{ github.repository }}/.*" \
             --certificate-oidc-issuer \
               "https://token.actions.githubusercontent.com" \
-            "$REF"
-          echo "✅ Verified"
+            "$IMAGE_REF" \
+            | tee cosign-verify-result.txt
+          echo "✅ Signature verified"
 
-  # ═══════════════════════════════════════════════════════════
-  # AUDIT
-  # ═══════════════════════════════════════════════════════════
+      - name: Upload artifact — cosign-verify-report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosign-verify-report
+          path: cosign-verify-result.txt
+          retention-days: 30
 
-  audit:
-    name: "Audit"
+
+# ============================================================
+# PHASE 7 — CI Audit Summary
+# Luôn chạy, không fail pipeline. Tổng hợp evidence.
+# ============================================================
+
+  ci_summary:
+    name: "CI Audit Summary"
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [gate-test, gate-build, sign]
+    needs:
+      - security_test_gate
+      - build_image
+      - artifact_gate
+      - sign_image
     if: always()
     steps:
-      - name: CI Summary
+      - name: Ghi CI Audit Summary
         run: |
-          echo "## 📊 CI Summary" >> $GITHUB_STEP_SUMMARY
-          echo "| Phase | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Test Material | ${{ needs.gate-test.result }} |" \
-            >> $GITHUB_STEP_SUMMARY
-          echo "| Build & Scan  | ${{ needs.gate-build.result }} |" \
-            >> $GITHUB_STEP_SUMMARY
-          echo "| Sign          | ${{ needs.sign.result }} |" \
-            >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Image:** \`${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}\`" \
-            >> $GITHUB_STEP_SUMMARY
-          echo "**Digest:** \`${{ needs.gate-build.outputs.digest }}\`" \
-            >> $GITHUB_STEP_SUMMARY
+          python3 << 'PYTHON_SCRIPT'
+          import os
+
+          def write(line=""):
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write(line + "\n")
+
+          def result_icon(r):
+              if r == "success":   return "✅"
+              if r == "skipped":   return "⏭️"
+              if r == "failure":   return "❌"
+              return "⚠️"
+
+          gate_result   = os.environ.get("GATE_RESULT",   "unknown")
+          build_result  = os.environ.get("BUILD_RESULT",  "unknown")
+          artgate_result= os.environ.get("ARTGATE_RESULT","unknown")
+          sign_result   = os.environ.get("SIGN_RESULT",   "unknown")
+          digest        = os.environ.get("DIGEST",        "N/A")
+          sha           = os.environ.get("SHA",           "N/A")
+          image_name    = os.environ.get("IMAGE_NAME",    "N/A")
+
+          write("# 📋 CI Audit Summary")
+          write()
+          write(f"**Run**: `{os.environ.get('GITHUB_RUN_ID', 'N/A')}`  ")
+          write(f"**Commit**: `{sha[:8] if sha != 'N/A' else 'N/A'}`  ")
+          write(f"**Branch**: `develop`")
+          write()
+
+          write("## Pipeline Result")
+          write()
+          write("| Phase | Job | Result |")
+          write("|-------|-----|--------|")
+          write(f"| Phase 1+2 | Security & Test Gate | {result_icon(gate_result)} {gate_result} |")
+          write(f"| Phase 3   | Build Image          | {result_icon(build_result)} {build_result} |")
+          write(f"| Phase 4+5 | Artifact Gate        | {result_icon(artgate_result)} {artgate_result} |")
+          write(f"| Phase 6   | Sign Image           | {result_icon(sign_result)} {sign_result} |")
+          write()
+
+          write("## Image")
+          write()
+          write(f"- **Image** : `{image_name}:{sha}`")
+          write(f"- **Digest**: `{digest}`")
+          write()
+
+          write("## Evidence Artifacts (lưu 30 ngày)")
+          write()
+          write("| Artifact | Nội dung |")
+          write("|----------|----------|")
+          write("| `semgrep-report`       | Semgrep SAST findings (JSON) |")
+          write("| `secret-scan-report`   | Gitleaks secret findings (JSON) |")
+          write("| `dependency-report`    | pip-audit CVE scan (JSON) |")
+          write("| `checkov-report`       | Checkov IaC/config check (JSON) |")
+          write("| `unit-test-report`     | pytest JUnit XML |")
+          write("| `image-digest`         | Immutable image digest |")
+          write("| `trivy-report`         | Trivy container scan (JSON) |")
+          write("| `sbom-report`          | SBOM CycloneDX JSON |")
+          write("| `cosign-verify-report` | Cosign signature verify result |")
+          write()
+          write("---")
+          write("*Tất cả artifacts có thể dùng làm audit evidence.*")
+
+          PYTHON_SCRIPT
+
+        env:
+          GATE_RESULT:    ${{ needs.security_test_gate.result }}
+          BUILD_RESULT:   ${{ needs.build_image.result }}
+          ARTGATE_RESULT: ${{ needs.artifact_gate.result }}
+          SIGN_RESULT:    ${{ needs.sign_image.result }}
+          DIGEST:         ${{ needs.artifact_gate.outputs.digest }}
+          SHA:            ${{ github.sha }}
+          IMAGE_NAME:     ${{ env.IMAGE_NAME }}
+          GITHUB_RUN_ID:  ${{ github.run_id }}
