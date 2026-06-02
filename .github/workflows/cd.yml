@@ -56,51 +56,32 @@ jobs:
           cosign-release: "v2.4.1"
 
       - name: Resolve image digest & inspect
-        # Lấy digest từ tag; ghi kết quả dù thành công hay thất bại
         run: |
           mkdir -p reports
 
-          DIGEST=$(docker manifest inspect \
-            "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" \
-            --verbose 2>/dev/null \
-            | python3 -c "
-          import json, sys
-          data = json.load(sys.stdin)
-          # manifest inspect trả về list hoặc single object
-          if isinstance(data, list):
-              d = data[0]
-          else:
-              d = data
-          digest = d.get('Descriptor', {}).get('digest') \
-                or d.get('RepoDigests', [None])[0]
-          print(digest or '')
-          " 2>/dev/null || true)
+          IMAGE_TAG_REF="${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
 
-          # Fallback: dùng docker pull + inspect
-          if [ -z "$DIGEST" ]; then
-            docker pull "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" 2>/dev/null || true
-            DIGEST=$(docker inspect \
-              "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" \
-              --format '{{index .RepoDigests 0}}' 2>/dev/null \
-              | sed 's/.*@/sha256:/' || true)
-            # Nếu vẫn empty, lấy từ image ID
-            if [ -z "$DIGEST" ]; then
-              DIGEST=$(docker inspect \
-                "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" \
-                --format '{{.Id}}' 2>/dev/null || echo "")
-            fi
-          fi
+          echo "Resolving digest for: $IMAGE_TAG_REF"
+
+          # Lấy đúng image index / manifest list digest.
+          # Đây là digest khớp với Docker Buildx output trong CI và digest đã được Cosign ký.
+          DIGEST=$(docker buildx imagetools inspect "$IMAGE_TAG_REF" \
+            --format '{{.Digest}}' 2>/dev/null || true)
 
           if [ -n "$DIGEST" ]; then
             echo "$DIGEST" > reports/image-digest.txt
-            echo "digest_status=ok"     > reports/inspect-status.txt
-            echo "Resolved digest: $DIGEST"
+            echo "digest_status=ok" > reports/inspect-status.txt
+            echo "Resolved image digest: $DIGEST"
           else
-            # Luôn tạo file để upload-artifact không fail và gate biết rõ lý do
-            echo "N/A"                  > reports/image-digest.txt
+            echo "N/A" > reports/image-digest.txt
             echo "digest_status=failed" > reports/inspect-status.txt
-            echo "WARNING: Could not resolve digest"
+            echo "WARNING: Could not resolve image digest"
           fi
+
+          {
+            echo "image=$IMAGE_TAG_REF"
+            echo "digest=${DIGEST:-N/A}"
+          } > reports/inspect-raw.txt
 
       - name: Upload artifact — image-digest
         if: always()
@@ -110,6 +91,7 @@ jobs:
           path: |
             reports/image-digest.txt
             reports/inspect-status.txt
+            reports/inspect-raw.txt
           retention-days: 30
 
       - name: Verify Cosign signature
