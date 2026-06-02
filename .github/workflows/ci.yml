@@ -21,6 +21,15 @@ on:
         options:
           - "true"
           - "false"
+      bypass_artifact_gate:
+        description: "Debug Only"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
+
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -1147,13 +1156,41 @@ jobs:
           write()
           write("---")
           write("*Evidence artifacts lưu 30 ngày.*")
+          bypass = os.environ.get("BYPASS_ARTIFACT_GATE", "false").lower() == "true"
 
           if should_block:
-              print("\n❌ ARTIFACT GATE FAILED:")
-              for r in block_reasons:
-                  print(f"  - {r}")
-              sys.exit(1)
+              if bypass:
+                  write("## ⚠️ DEBUG BYPASS ENABLED")
+                  write()
+                  write("Artifact Gate phát hiện lỗi nhưng không block vì đang chạy workflow_dispatch để test các phase sau.")
+                  write()
+                  write("Lý do đáng lẽ bị block:")
+                  for reason in block_reasons:
+                      write(f"- {reason}")
+
+                  set_output("passed", "true")
+
+                  print("\n⚠️ ARTIFACT GATE WOULD BLOCK, but DEBUG BYPASS is enabled")
+                  for r in block_reasons:
+                      print(f"  - {r}")
+                  sys.exit(0)
+              else:
+                  write("## ❌ Block — Không sign/promote image")
+                  write()
+                  write("Lý do:")
+                  for reason in block_reasons:
+                      write(f"- {reason}")
+
+                  set_output("passed", "false")
+
+                  print("\n❌ ARTIFACT GATE FAILED:")
+                  for r in block_reasons:
+                      print(f"  - {r}")
+                  sys.exit(1)
           else:
+              write("## ✅ Allow — Tiến hành sign image")
+              set_output("passed", "true")
+
               print("\n✅ ARTIFACT GATE PASSED — proceeding to sign")
               sys.exit(0)
 
@@ -1164,6 +1201,9 @@ jobs:
           GITHUB_SHA: ${{ github.sha }}
           BUILD_DIGEST: ${{ needs.build_image.outputs.digest }}
           ARTIFACT_SCAN_RESULT: ${{ needs.artifact_scan.result }}
+          BYPASS_ARTIFACT_GATE: ${{ github.event.inputs.bypass_artifact_gate || 'false' }}
+
+
 
 
 # ============================================================
