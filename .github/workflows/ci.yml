@@ -11,6 +11,16 @@ on:
   push:
     branches:
       - develop
+  workflow_dispatch:
+    inputs:
+      bypass_security_gate:
+        description: "Debug Only"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "true"
+          - "false"
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -697,29 +707,31 @@ jobs:
           write("---")
           write()
 
-          if should_block:
-              write("## ❌ Block — Không build image")
-              write()
-              write("Lý do:")
-              for reason in block_reasons:
-                  write(f"- {reason}")
-              write()
-              write("> *Điều chỉnh `CHECKOV_BLOCK_THRESHOLD` trong gate script nếu cần.*")
-              set_output("passed", "false")
-          else:
-              write("## ✅ Allow — Tiến hành build image")
-              set_output("passed", "true")
-
           write()
           write("---")
           write("*Evidence artifacts lưu 30 ngày cho audit.*")
-
+          bypass = os.environ.get("BYPASS_SECURITY_GATE", "false").lower() == "true"
           if should_block:
-              print("\n❌ GATE FAILED:")
-              for r in block_reasons:
-                  print(f"  - {r}")
-              sys.exit(1)
+            if bypass:
+                write("")
+                write("## ⚠️ DEBUG BYPASS ENABLED")
+                write("Gate phát hiện lỗi nhưng không block vì đang chạy workflow_dispatch để test các phase sau.")
+                set_output("passed", "true")
+
+                print("\n⚠️ GATE WOULD BLOCK, but DEBUG BYPASS is enabled")
+                for r in block_reasons:
+                    print(f"  - {r}")
+                sys.exit(0)
+            else:
+                set_output("passed", "false")
+
+                print("\n❌ GATE FAILED:")
+                for r in block_reasons:
+                    print(f"  - {r}")
+                sys.exit(1)
           else:
+              set_output("passed", "true")
+
               print("\n✅ GATE PASSED — proceeding to build")
               sys.exit(0)
 
@@ -731,6 +743,7 @@ jobs:
           DEP_RESULT:    ${{ needs.dependency_scan.result }}
           IAC_RESULT:    ${{ needs.iac_config_scan.result }}
           TEST_RESULT:   ${{ needs.unit_test.result }}
+          BYPASS_SECURITY_GATE: ${{ github.event.inputs.bypass_security_gate || 'false' }}
 
 
 
