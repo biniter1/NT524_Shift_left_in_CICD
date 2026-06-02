@@ -1,15 +1,11 @@
-name: CD Pipeline
+# ============================================================
+# CD Pipeline
+# Mindset: Verify/Test/Deploy tạo evidence → Gate tổng hợp →
+#          Gate quyết định → Pass mới đi tiếp
+# CD không build lại image — chỉ verify/deploy artifact từ CI
+# ============================================================
 
-# Prerequisites / Setup Notes:
-# - Push to branch `release` triggers this pipeline
-# - Image ghcr.io/biniter1/nt524_shift_left_in_cicd:dev-latest must exist (built by CI)
-# - Secrets required: EC2_HOST, EC2_SSH_KEY
-# - EC2 must have: docker, kind, kubectl, curl
-# - kind cluster named `staging` must exist on EC2
-# - Repo must have: k8s/staging/{namespace,postgres,app}.yaml
-#                   k8s/production/{namespace,postgres,app}.yaml
-# - app.yaml must use IMAGE_PLACEHOLDER
-# - GitHub Environment `production` needed for manual approval
+name: CD Pipeline
 
 on:
   push:
@@ -18,9 +14,9 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: 'Image tag to deploy'
+        description: "Image tag to deploy"
         required: false
-        default: 'dev-latest'
+        default: "dev-latest"
 
 concurrency:
   group: cd-${{ github.ref }}
@@ -28,26 +24,26 @@ concurrency:
 
 env:
   IMAGE_NAME: ghcr.io/biniter1/nt524_shift_left_in_cicd
-  IMAGE_TAG: ${{ github.event.inputs.image_tag || 'dev-latest' }}
-  REGISTRY: ghcr.io
-  SECURITY_ENFORCE: "false"
+  IMAGE_TAG:  ${{ github.event.inputs.image_tag || 'dev-latest' }}
+  REGISTRY:   ghcr.io
 
 jobs:
-  # ═══════════════════════════════════════════════════════════
-  # STEP 1 — VERIFY IMAGE từ registry
-  # ═══════════════════════════════════════════════════════════
 
-  verify:
-    name: "Verify Image"
+# ============================================================
+# PHASE 1 — Resolve & Verify Artifact Evidence
+# Mỗi verify step ghi result ra file; KHÔNG fail job ngay.
+# verify_gate mới là nơi quyết định block/allow.
+# ============================================================
+
+  verify_artifact:
+    name: "Verify Artifact (Cosign + SBOM)"
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     permissions:
       packages: read
       id-token: write
-    outputs:
-      passed: ${{ steps.verify_gate.outputs.passed }}
     steps:
-      - name: Login to Registry
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -56,102 +52,320 @@ jobs:
 
       - name: Install Cosign
         uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: "v2.4.1"
 
-      # Technical failure — must fail if image doesn't exist
-      - name: Pull image
+      - name: Resolve image digest & inspect
+        # Lấy digest từ tag; ghi kết quả dù thành công hay thất bại
         run: |
-          docker pull ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-          echo "✅ Image pulled: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          mkdir -p reports
 
-      - name: Verify signature
-        id: cosign_verify
+          DIGEST=$(docker manifest inspect \
+            "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" \
+            --verbose 2>/dev/null \
+            | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          # manifest inspect trả về list hoặc single object
+          if isinstance(data, list):
+              d = data[0]
+          else:
+              d = data
+          digest = d.get('Descriptor', {}).get('digest') \
+                or d.get('RepoDigests', [None])[0]
+          print(digest or '')
+          " 2>/dev/null || true)
+
+          # Fallback: dùng docker pull + inspect
+          if [ -z "$DIGEST" ]; then
+            docker pull "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" 2>/dev/null || true
+            DIGEST=$(docker inspect \
+              "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" \
+              --format '{{index .RepoDigests 0}}' 2>/dev/null \
+              | sed 's/.*@/sha256:/' || true)
+            # Nếu vẫn empty, lấy từ image ID
+            if [ -z "$DIGEST" ]; then
+              DIGEST=$(docker inspect \
+                "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}" \
+                --format '{{.Id}}' 2>/dev/null || echo "")
+            fi
+          fi
+
+          if [ -n "$DIGEST" ]; then
+            echo "$DIGEST" > reports/image-digest.txt
+            echo "digest_status=ok"     > reports/inspect-status.txt
+            echo "Resolved digest: $DIGEST"
+          else
+            # Luôn tạo file để upload-artifact không fail và gate biết rõ lý do
+            echo "N/A"                  > reports/image-digest.txt
+            echo "digest_status=failed" > reports/inspect-status.txt
+            echo "WARNING: Could not resolve digest"
+          fi
+
+      - name: Upload artifact — image-digest
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-digest
+          path: |
+            reports/image-digest.txt
+            reports/inspect-status.txt
+          retention-days: 30
+
+      - name: Verify Cosign signature
+        # || true → job không fail; ghi result ra file
         run: |
+          DIGEST_FILE=reports/image-digest.txt
+          if [ -f "$DIGEST_FILE" ]; then
+            DIGEST=$(cat "$DIGEST_FILE")
+            IMAGE_REF="${{ env.IMAGE_NAME }}@${DIGEST}"
+          else
+            IMAGE_REF="${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          fi
+
           cosign verify \
             --certificate-identity-regexp \
-              "https://github.com/biniter1/.*" \
+              "https://github.com/${{ github.repository }}/.*" \
             --certificate-oidc-issuer \
               "https://token.actions.githubusercontent.com" \
-            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-          echo "✅ Signature verified"
-        continue-on-error: true
+            "$IMAGE_REF" \
+            > reports/cosign-verify-raw.txt 2>&1 \
+            && echo "sig_status=valid"   > reports/cosign-status.txt \
+            || echo "sig_status=invalid" > reports/cosign-status.txt
+
+          echo "Cosign verify result:"
+          cat reports/cosign-status.txt
+          cat reports/cosign-verify-raw.txt || true
+
+      - name: Upload artifact — cosign-verify-report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cosign-verify-report
+          path: |
+            reports/cosign-status.txt
+            reports/cosign-verify-raw.txt
+          retention-days: 30
 
       - name: Verify SBOM attestation
-        id: sbom_verify
+        # cosign tree kiểm tra attestations; || true để không fail job
         run: |
-          COUNT=$(cosign tree \
-            ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} 2>/dev/null \
-            | grep -c "Attestations" || echo "0")
-          if [[ "$COUNT" -gt 0 ]]; then
-            echo "✅ SBOM attestation found"
+          DIGEST_FILE=reports/image-digest.txt
+          if [ -f "$DIGEST_FILE" ]; then
+            IMAGE_REF="${{ env.IMAGE_NAME }}@$(cat $DIGEST_FILE)"
           else
-            echo "⚠️ No SBOM attestation found"
-            exit 1
+            IMAGE_REF="${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
           fi
+
+          cosign tree "$IMAGE_REF" > reports/cosign-tree-raw.txt 2>&1 || true
+
+          ATTEST_COUNT=$(grep -c -i "attestation\|attest" \
+            reports/cosign-tree-raw.txt 2>/dev/null || echo "0")
+
+          if [ "$ATTEST_COUNT" -gt 0 ]; then
+            echo "sbom_status=found"    > reports/sbom-status.txt
+            echo "attestation_count=$ATTEST_COUNT" >> reports/sbom-status.txt
+          else
+            echo "sbom_status=missing"  > reports/sbom-status.txt
+            echo "attestation_count=0"  >> reports/sbom-status.txt
+          fi
+
+          echo "SBOM attestation status:"
+          cat reports/sbom-status.txt
+
+      - name: Upload artifact — sbom-attestation-report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-attestation-report
+          path: |
+            reports/sbom-status.txt
+            reports/cosign-tree-raw.txt
+          retention-days: 30
+
+      - name: Write verify-artifact summary report
+        if: always()
+        run: |
+          python3 << 'PYEOF'
+          import os
+
+          def read(path, default=""):
+              try:
+                  return open(path).read().strip()
+              except:
+                  return default
+
+          digest     = read("reports/image-digest.txt",  "N/A")
+          inspect_st = read("reports/inspect-status.txt","digest_status=unknown")
+          cosign_st  = read("reports/cosign-status.txt", "sig_status=unknown")
+          sbom_st    = read("reports/sbom-status.txt",   "sbom_status=unknown")
+
+          report = {
+              "image":     "${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}",
+              "digest":    digest,
+              "inspect":   inspect_st,
+              "signature": cosign_st,
+              "sbom":      sbom_st,
+          }
+
+          import json
+          with open("reports/verify-artifact-report.json", "w") as f:
+              json.dump(report, f, indent=2)
+          print("verify-artifact-report.json written")
+          print(json.dumps(report, indent=2))
+          PYEOF
+
+      - name: Upload artifact — verify-artifact-report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-artifact-report
+          path: reports/verify-artifact-report.json
+          retention-days: 30
+
+
+# ============================================================
+# PHASE 2 — Verify Gate
+# Nơi DUY NHẤT có thể fail ở phase 1.
+# Nếu fail → không deploy staging.
+# ============================================================
+
+  verify_gate:
+    name: "Verify Gate"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [verify_artifact]
+    if: always()
+    outputs:
+      passed: ${{ steps.gate.outputs.passed }}
+      digest: ${{ steps.gate.outputs.digest }}
+    steps:
+      - name: Download verify artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
         continue-on-error: true
 
-      - name: Evaluate verify gate
-        id: verify_gate
+      - name: Parse & quyết định Verify Gate
+        id: gate
         run: |
-          echo "## 🔍 Verify Image" >> $GITHUB_STEP_SUMMARY
-          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Image Pull | ✅ OK |" >> $GITHUB_STEP_SUMMARY
+          python3 << 'PYTHON_SCRIPT'
+          import json, os, sys
 
-          if [[ "${{ steps.cosign_verify.outcome }}" == "success" ]]; then
-            echo "| Signature Verify | ✅ Verified |" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "| Signature Verify | ⚠️ Not verified |" >> $GITHUB_STEP_SUMMARY
-          fi
+          def read_file(path, default=""):
+              try:
+                  return open(path).read().strip()
+              except:
+                  return default
 
-          if [[ "${{ steps.sbom_verify.outcome }}" == "success" ]]; then
-            echo "| SBOM Attestation | ✅ Found |" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "| SBOM Attestation | ⚠️ Not found |" >> $GITHUB_STEP_SUMMARY
-          fi
+          def load_json(path):
+              try:
+                  return json.load(open(path))
+              except:
+                  return None
 
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- Mode: **SECURITY_ENFORCE=${{ env.SECURITY_ENFORCE }}**" >> $GITHUB_STEP_SUMMARY
+          def write(line=""):
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write(line + "\n")
 
-          if [[ "${{ env.SECURITY_ENFORCE }}" == "true" ]]; then
-            if [[ "${{ steps.cosign_verify.outcome }}" == "failure" ]] || \
-               [[ "${{ steps.sbom_verify.outcome }}" == "failure" ]]; then
-              echo "### ❌ Verify FAILED — enforcement mode" >> $GITHUB_STEP_SUMMARY
-              echo "passed=false" >> $GITHUB_OUTPUT
-              exit 1
-            fi
-          else
-            if [[ "${{ steps.cosign_verify.outcome }}" == "failure" ]] || \
-               [[ "${{ steps.sbom_verify.outcome }}" == "failure" ]]; then
-              echo "### ⚠️ Signature/SBOM warnings detected — allowed in verification mode" >> $GITHUB_STEP_SUMMARY
-            fi
-          fi
+          def set_output(key, val):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"{key}={val}\n")
 
-          echo "### ✅ Verify PASSED — continue to staging" >> $GITHUB_STEP_SUMMARY
-          echo "passed=true" >> $GITHUB_OUTPUT
+          art = "./artifacts"
 
-  # ═══════════════════════════════════════════════════════════
-  # STEP 2 — STAGING
-  # Deploy → Smoke test → Perf test → DAST
-  # ═══════════════════════════════════════════════════════════
+          # ── Load evidence ──────────────────────────────────
+          digest     = read_file(f"{art}/image-digest/image-digest.txt")
+          inspect_st = read_file(f"{art}/image-digest/inspect-status.txt")   # Fix: đúng artifact
+          cosign_st  = read_file(f"{art}/cosign-verify-report/cosign-status.txt")
+          sbom_st    = read_file(f"{art}/sbom-attestation-report/sbom-status.txt")
+          report     = load_json(f"{art}/verify-artifact-report/verify-artifact-report.json")
 
-  staging:
-    name: "Staging"
+          report_missing = report is None
+
+          sig_valid   = "sig_status=valid"   in cosign_st
+          sbom_found  = "sbom_status=found"  in sbom_st
+          digest_ok   = bool(digest and digest != "N/A")
+
+          # ── Gate Policy ────────────────────────────────────
+          block_reasons = []
+
+          if report_missing:
+              block_reasons.append("verify-artifact-report bị thiếu — verify job có thể bị lỗi")
+          if not digest_ok:
+              block_reasons.append("Không resolve được image digest")
+          if not sig_valid:
+              block_reasons.append("Cosign signature không hợp lệ hoặc không tìm thấy")
+          if not sbom_found:
+              block_reasons.append("SBOM attestation không tồn tại")
+
+          should_block = bool(block_reasons)
+
+          # ── Write Summary ──────────────────────────────────
+          write("# 🔏 Verify Gate")
+          write()
+          write("## Artifact Verification")
+          write()
+          write("| Check | Status |")
+          write("|-------|--------|")
+          write(f"| Image  | `${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}` |")
+          write(f"| Digest | `{digest or 'N/A'}` |")
+          write(f"| Cosign Signature | {'✅ Valid' if sig_valid else '❌ Invalid/Missing'} |")
+          write(f"| SBOM Attestation | {'✅ Found' if sbom_found else '❌ Missing'} |")
+          write()
+
+          write("---")
+          write()
+          if should_block:
+              write("## ❌ Block — Không deploy staging")
+              write()
+              write("Lý do:")
+              for r in block_reasons:
+                  write(f"- {r}")
+              set_output("passed", "false")
+              set_output("digest", digest or "")
+          else:
+              write("## ✅ Allow — Tiến hành deploy staging")
+              set_output("passed", "true")
+              set_output("digest", digest)
+
+          write()
+          write("---")
+          write("*Evidence artifacts lưu 30 ngày.*")
+
+          if should_block:
+              print("\n❌ VERIFY GATE FAILED:")
+              for r in block_reasons:
+                  print(f"  - {r}")
+              sys.exit(1)
+          else:
+              print(f"\n✅ VERIFY GATE PASSED — digest: {digest}")
+
+          PYTHON_SCRIPT
+
+        env:
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          IMAGE_TAG:  ${{ env.IMAGE_TAG }}
+
+
+# ============================================================
+# PHASE 3 — Deploy Staging & Collect Evidence
+# Mỗi bước tạo report; staging_gate mới quyết định block/allow
+# ============================================================
+
+  deploy_staging:
+    name: "Deploy Staging"
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-    needs: [verify]
-    if: needs.verify.outputs.passed == 'true'
+    timeout-minutes: 40
+    needs: [verify_gate]
+    if: needs.verify_gate.outputs.passed == 'true'
     permissions:
       contents: read
       packages: read
-      issues: write
-    outputs:
-      dast_high: ${{ steps.zap-parse.outputs.high }}
-      dast_medium: ${{ steps.zap-parse.outputs.medium }}
-      dast_low: ${{ steps.zap-parse.outputs.low }}
+      issues:   write
     steps:
       - uses: actions/checkout@v4
 
-      # Technical failures below — SSH/deploy/test must fail the job
       - name: Setup SSH
         run: |
           mkdir -p ~/.ssh
@@ -159,39 +373,39 @@ jobs:
           chmod 600 ~/.ssh/ec2_key.pem
           ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
 
-      - name: Copy k8s manifests to EC2
+      - name: Copy k8s staging manifests
         run: |
           scp -i ~/.ssh/ec2_key.pem -r k8s/staging \
             ubuntu@${{ secrets.EC2_HOST }}:/home/ubuntu/k8s-staging
 
       - name: Deploy to staging
+        id: deploy
         run: |
-          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
+          # set +e: tắt fail-fast để $? luôn được bắt sau SSH dù lệnh fail
+          set +e
+          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
+            IMAGE="${{ env.IMAGE_NAME }}@${{ needs.verify_gate.outputs.digest }}" \
+            ACTOR="${{ github.actor }}" \
+            TOKEN="${{ secrets.GITHUB_TOKEN }}" \
+            bash << 'REMOTE'
             set -e
 
-            echo "${{ secrets.GITHUB_TOKEN }}" \
-              | docker login ghcr.io \
-              -u ${{ github.actor }} --password-stdin
+            echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
 
             kind get clusters | grep -q staging \
               || { echo "❌ staging cluster not found"; exit 1; }
-
             kind export kubeconfig --name staging
 
-            docker pull --platform linux/amd64 \
-              ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-            kind load docker-image \
-              ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
-              --name staging
+            # Deploy bằng digest (immutable) thay vì tag có thể bị ghi đè
+            docker pull --platform linux/amd64 "$IMAGE"
+            kind load docker-image "$IMAGE" --name staging
 
             kubectl delete namespace staging --ignore-not-found=true
             sleep 3
-
             kubectl apply -f /home/ubuntu/k8s-staging/namespace.yaml
             kubectl apply -f /home/ubuntu/k8s-staging/postgres.yaml
-            sed "s|IMAGE_PLACEHOLDER|${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" \
-              /home/ubuntu/k8s-staging/app.yaml \
-              | kubectl apply -f -
+            sed "s|IMAGE_PLACEHOLDER|${IMAGE}|g" \
+              /home/ubuntu/k8s-staging/app.yaml | kubectl apply -f -
 
             kubectl rollout status deployment/postgres \
               -n staging --timeout=120s
@@ -199,14 +413,59 @@ jobs:
               -n staging --timeout=180s
 
             echo "✅ Deployed to staging"
-          ENDSSH
+          REMOTE
+          # Bắt $? ngay sau SSH — set +e đảm bảo dòng này luôn chạy
+          DEPLOY_EXIT=$?
+          echo "DEPLOY_EXIT=${DEPLOY_EXIT}" >> $GITHUB_ENV
+          # exit 0 để step không fail; gate sẽ đọc DEPLOY_EXIT để quyết định
+          exit 0
 
-      - name: Smoke test
+        continue-on-error: true
+
+      - name: Collect deployment evidence
+        if: always()
         run: |
-          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
-            set -e
-            kind export kubeconfig --name staging
+          mkdir -p staging-evidence
+          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
+            bash << 'REMOTE' > staging-evidence/kubectl-state.txt 2>&1 || true
+            kind export kubeconfig --name staging 2>/dev/null || true
+            echo "=== Deployments ==="
+            kubectl get deploy -n staging -o wide 2>/dev/null || echo "N/A"
+            echo "=== Pods ==="
+            kubectl get pods -n staging -o wide 2>/dev/null || echo "N/A"
+            echo "=== Services ==="
+            kubectl get svc -n staging 2>/dev/null || echo "N/A"
+            echo "=== Rollout History ==="
+            kubectl rollout history deployment/restaurant-app -n staging 2>/dev/null || echo "N/A"
+            echo "=== Events ==="
+            kubectl get events -n staging \
+              --sort-by=.metadata.creationTimestamp 2>/dev/null | tail -20 || echo "N/A"
+          REMOTE
 
+          # Ghi deploy status JSON — dùng DEPLOY_EXIT uppercase (set ở step trước)
+          DEPLOY_STATUS="success"
+          [ "${DEPLOY_EXIT:-1}" != "0" ] && DEPLOY_STATUS="failed"
+          DEPLOYED_IMAGE="${{ env.IMAGE_NAME }}@${{ needs.verify_gate.outputs.digest }}"
+          echo "{\"deploy_status\":\"${DEPLOY_STATUS}\",\"image\":\"${DEPLOYED_IMAGE}\"}" \
+            > staging-evidence/deploy-status.json
+
+      - name: Upload artifact — staging-deployment-evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-deployment-evidence
+          path: staging-evidence/
+          retention-days: 30
+
+      # ── Smoke test Alpha ───────────────────────────────────
+      - name: Smoke test (Alpha)
+        id: smoke
+        if: always()
+        run: |
+          mkdir -p smoke-out
+          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
+            bash << 'REMOTE' > smoke-out/smoke-raw.txt 2>&1 || true
+            kind export kubeconfig --name staging 2>/dev/null || true
             pkill -f "kubectl port-forward.*18000" || true
             sleep 2
 
@@ -214,227 +473,431 @@ jobs:
               -n staging > /tmp/pf-staging.log 2>&1 &
             sleep 8
 
+            SMOKE_STATUS="failed"
             for i in $(seq 1 10); do
-              if curl -sf http://localhost:18000/docs > /dev/null; then
-                echo "✅ Smoke test passed"
+              if curl -sf http://localhost:18000/docs > /dev/null 2>&1; then
+                SMOKE_STATUS="passed"
                 break
               fi
-              [[ $i -eq 10 ]] && {
-                echo "❌ App unhealthy after smoke test"
-                cat /tmp/pf-staging.log
-                exit 1
-              }
               sleep 5
             done
-          ENDSSH
 
-      - name: Performance test
+            echo "smoke_status=${SMOKE_STATUS}"
+          REMOTE
+
+          # Parse smoke status từ output
+          SMOKE=$(grep "smoke_status=" smoke-out/smoke-raw.txt \
+            | tail -1 | cut -d= -f2 || echo "failed")
+          echo "{\"smoke_status\":\"${SMOKE}\"}" > smoke-out/smoke-report.json
+          cat smoke-out/smoke-report.json
+
+        continue-on-error: true
+
+      - name: Upload artifact — smoke-report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-report
+          path: smoke-out/smoke-report.json
+          retention-days: 30
+
+      # ── Performance test Beta ──────────────────────────────
+      - name: Performance test (Beta — 100 requests)
+        id: perf
+        if: always()
         run: |
-          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
-            set -e
-            kind export kubeconfig --name staging
+          mkdir -p perf-out
+          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
+            bash << 'REMOTE' > perf-out/perf-raw.txt 2>&1 || true
+            kind export kubeconfig --name staging 2>/dev/null || true
 
-            echo "Running basic load test (100 requests)..."
-            SUCCESS=0
-            FAIL=0
+            SUCCESS=0; FAIL=0
             for i in $(seq 1 100); do
-              if curl -sf http://localhost:18000/docs > /dev/null; then
-                SUCCESS=$((SUCCESS + 1))
+              if curl -sf http://localhost:18000/docs > /dev/null 2>&1; then
+                SUCCESS=$((SUCCESS+1))
               else
-                FAIL=$((FAIL + 1))
+                FAIL=$((FAIL+1))
               fi
             done
 
-            echo "Success: ${SUCCESS}/100, Failed: ${FAIL}/100"
             ERROR_RATE=$((FAIL * 100 / 100))
+            echo "perf_success=${SUCCESS}"
+            echo "perf_fail=${FAIL}"
+            echo "perf_error_rate=${ERROR_RATE}"
+          REMOTE
 
-            if [[ "$ERROR_RATE" -gt 10 ]]; then
-              echo "❌ Error rate ${ERROR_RATE}% exceeds 10% threshold"
-              exit 1
-            fi
-            echo "✅ Performance test passed"
-          ENDSSH
+          # Parse perf numbers
+          SUCCESS=$(grep "perf_success=" perf-out/perf-raw.txt | tail -1 | cut -d= -f2 || echo "0")
+          FAIL=$(grep    "perf_fail="    perf-out/perf-raw.txt | tail -1 | cut -d= -f2 || echo "100")
+          RATE=$(grep    "perf_error_rate=" perf-out/perf-raw.txt | tail -1 | cut -d= -f2 || echo "100")
 
-      - name: Expose app for DAST
+          echo "{\"total\":100,\"success\":${SUCCESS},\"fail\":${FAIL},\"error_rate_pct\":${RATE}}" \
+            > perf-out/perf-report.json
+          cat perf-out/perf-report.json
+
+        continue-on-error: true
+
+      - name: Upload artifact — perf-report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: perf-report
+          path: perf-out/perf-report.json
+          retention-days: 30
+
+      # ── DAST RC — OWASP ZAP ───────────────────────────────
+      - name: Expose staging app for DAST
+        if: always()
         run: |
+          # Port-forward trên EC2 bind 0.0.0.0 để runner tunnel được
           ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
-            "nohup kubectl port-forward svc/restaurant-app 18000:8000 \
-             -n staging --address 0.0.0.0 > /tmp/pf-dast.log 2>&1 &"
+            "kind export kubeconfig --name staging 2>/dev/null || true; \
+             pkill -f 'kubectl port-forward.*18000' || true; sleep 1; \
+             nohup kubectl port-forward svc/restaurant-app 18000:8000 \
+               -n staging --address 0.0.0.0 > /tmp/pf-dast.log 2>&1 &"
 
+          # SSH tunnel: runner:8000 → EC2:18000
           ssh -i ~/.ssh/ec2_key.pem \
             -L 8000:localhost:18000 \
             -N -f \
-            ubuntu@${{ secrets.EC2_HOST }}
+            ubuntu@${{ secrets.EC2_HOST }} \
+            || true
           sleep 8
-
           curl -sf http://localhost:8000/docs \
-            && echo "✅ Tunnel ready" \
-            || { echo "❌ DAST tunnel failed"; exit 1; }
+            && echo "Tunnel ready" \
+            || echo "WARNING: tunnel may not be ready"
 
-      # DAST — security finding, not a technical failure
-      - name: DAST — OWASP ZAP
-        id: zap
-        uses: zaproxy/action-baseline@v0.12.0
-        with:
-          target: "http://localhost:8000"
-          rules_file_name: '.zap/rules.tsv'
-          cmd_options: '-a'
-          fail_action: false
-          artifact_name: zap-report
         continue-on-error: true
 
-      - name: Parse ZAP results
-        id: zap-parse
+      - name: DAST — OWASP ZAP baseline
+        id: zap
+        if: always()
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target:          "http://localhost:8000"
+          rules_file_name: ".zap/rules.tsv"
+          cmd_options:     "-a"
+          fail_action:     false          # KHÔNG fail job; gate quyết định
+          artifact_name:   zap-report
+        continue-on-error: true
+
+      - name: Parse ZAP results & write summary JSON
+        id: zap_parse
         if: always()
         run: |
-          if [ -f "report_json.json" ]; then
-            HIGH=$(jq '[.site[].alerts[] | select(.riskcode == "3")] | length' \
-              report_json.json 2>/dev/null || echo "0")
-            MEDIUM=$(jq '[.site[].alerts[] | select(.riskcode == "2")] | length' \
-              report_json.json 2>/dev/null || echo "0")
-            LOW=$(jq '[.site[].alerts[] | select(.riskcode == "1")] | length' \
-              report_json.json 2>/dev/null || echo "0")
-          else
-            HIGH=0
-            MEDIUM=0
-            LOW=0
-          fi
-          echo "high=${HIGH}" >> $GITHUB_OUTPUT
-          echo "medium=${MEDIUM}" >> $GITHUB_OUTPUT
-          echo "low=${LOW}" >> $GITHUB_OUTPUT
-          echo "DAST — High:${HIGH} Medium:${MEDIUM} Low:${LOW}"
+          mkdir -p zap-out
 
-      # Create issue only when HIGH > 0, but never block pipeline
-      - name: Create issue for HIGH findings
-        if: always() && steps.zap-parse.outputs.high > 0
+          if [ -f "report_json.json" ]; then
+            HIGH=$(python3 -c "
+          import json
+          data = json.load(open('report_json.json'))
+          alerts = [a for s in data.get('site', []) for a in s.get('alerts', [])]
+          print(sum(1 for a in alerts if str(a.get('riskcode','')) == '3'))
+          " 2>/dev/null || echo "0")
+            MEDIUM=$(python3 -c "
+          import json
+          data = json.load(open('report_json.json'))
+          alerts = [a for s in data.get('site', []) for a in s.get('alerts', [])]
+          print(sum(1 for a in alerts if str(a.get('riskcode','')) == '2'))
+          " 2>/dev/null || echo "0")
+            LOW=$(python3 -c "
+          import json
+          data = json.load(open('report_json.json'))
+          alerts = [a for s in data.get('site', []) for a in s.get('alerts', [])]
+          print(sum(1 for a in alerts if str(a.get('riskcode','')) == '1'))
+          " 2>/dev/null || echo "0")
+            # report_missing=false → gate biết ZAP thật sự chạy
+            echo "{\"high\":${HIGH},\"medium\":${MEDIUM},\"low\":${LOW},\"report_missing\":false}" \
+              > zap-out/zap-summary.json
+          else
+            # report_missing=true → gate phân biệt "ZAP không chạy được" vs "không có finding"
+            echo '{"high":0,"medium":0,"low":0,"report_missing":true}' \
+              > zap-out/zap-summary.json
+          fi
+
+          cat zap-out/zap-summary.json
+
+        continue-on-error: true
+
+      - name: Upload artifact — zap-summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-summary
+          path: zap-out/zap-summary.json
+          retention-days: 30
+
+      - name: Open GitHub Issue nếu ZAP HIGH > 0
+        if: always()
         uses: actions/github-script@v7
         with:
           script: |
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: `[DAST] 🔴 ${{ steps.zap-parse.outputs.high }} HIGH findings`,
-              body: [
-                '## DAST Findings',
-                '| Severity | Count |',
-                '|----------|-------|',
-                `| 🔴 High   | ${{ steps.zap-parse.outputs.high }} |`,
-                `| 🟡 Medium | ${{ steps.zap-parse.outputs.medium }} |`,
-                `| 🟢 Low    | ${{ steps.zap-parse.outputs.low }} |`,
-                `\n**Image:** \`${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}\``,
-                `\n**Mode:** SECURITY_ENFORCE=${{ env.SECURITY_ENFORCE }}`,
-              ].join('\n'),
-              labels: ['security', 'dast']
-            });
+            const fs = require('fs');
+            let high = 0, medium = 0, low = 0;
+            try {
+              const zap = JSON.parse(fs.readFileSync('zap-out/zap-summary.json', 'utf8'));
+              high = zap.high || 0;
+              medium = zap.medium || 0;
+              low = zap.low || 0;
+            } catch(e) {}
+
+            if (high > 0) {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                title: `[DAST] 🔴 ${high} HIGH findings — ${{ env.IMAGE_TAG }}`,
+                body: [
+                  '## DAST Scan Results',
+                  '| Severity | Count |',
+                  '|----------|-------|',
+                  `| 🔴 High   | ${high} |`,
+                  `| 🟡 Medium | ${medium} |`,
+                  `| 🟢 Low    | ${low} |`,
+                  `\n**Image:** \`${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}\``,
+                  `**Run:** ${context.runId}`,
+                ].join('\n'),
+                labels: ['security', 'dast'],
+              });
+            }
+
         continue-on-error: true
 
-      - name: Write Staging summary
-        if: always()
-        run: |
-          echo "## 🚀 Staging Results" >> $GITHUB_STEP_SUMMARY
-          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Deploy | ${{ steps.zap.outcome != '' && '✅ OK' || '⚠️ check logs' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| DAST High   | **${{ steps.zap-parse.outputs.high || 0 }}** |" >> $GITHUB_STEP_SUMMARY
-          echo "| DAST Medium | **${{ steps.zap-parse.outputs.medium || 0 }}** |" >> $GITHUB_STEP_SUMMARY
-          echo "| DAST Low    | **${{ steps.zap-parse.outputs.low || 0 }}** |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- Mode: **SECURITY_ENFORCE=${{ env.SECURITY_ENFORCE }}**" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ env.SECURITY_ENFORCE }}" == "false" ]]; then
-            echo "- ⚠️ DAST findings are collected but not blocking in verification mode" >> $GITHUB_STEP_SUMMARY
-          fi
-
-      - name: Cleanup staging
+      - name: Cleanup staging tunnels
         if: always()
         run: |
           ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
             "pkill -f 'kubectl port-forward.*18000' || true" || true
-          pkill -f "ssh.*18000" || true
+          pkill -f "ssh.*-L 8000" || true
 
-  # ═══════════════════════════════════════════════════════════
-  # GATE STAGING
-  # ═══════════════════════════════════════════════════════════
 
-  gate-staging:
-    name: "Gate Staging"
+# ============================================================
+# PHASE 4 — Staging Gate
+# Nơi DUY NHẤT fail phase staging.
+# Nếu fail → không manual approval, không production.
+# ============================================================
+
+  staging_gate:
+    name: "Staging Gate"
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-    needs: [staging]
-    if: always()
+    timeout-minutes: 10
+    needs: [deploy_staging]
+    if: always() && needs.deploy_staging.result != 'skipped'
     outputs:
       passed: ${{ steps.gate.outputs.passed }}
     steps:
-      - name: Evaluate gate
+      - name: Download staging artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+        continue-on-error: true
+
+      - name: Parse & quyết định Staging Gate
         id: gate
         run: |
-          echo "## 🚦 Gate Staging" >> $GITHUB_STEP_SUMMARY
-          echo "| Check | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
+          python3 << 'PYTHON_SCRIPT'
+          import json, os, sys
 
-          BLOCK=0
-          HIGH="${{ needs.staging.outputs.dast_high }}"
+          PERF_ERROR_THRESHOLD = 10   # % error rate tối đa
 
-          if [[ "${{ needs.staging.result }}" == "failure" ]]; then
-            echo "| Staging Deploy & Test | ❌ FAILED |" >> $GITHUB_STEP_SUMMARY
-            BLOCK=$((BLOCK + 1))
-          else
-            echo "| Staging Deploy & Test | ✅ PASSED |" >> $GITHUB_STEP_SUMMARY
-          fi
+          def load_json(path):
+              try:
+                  return json.load(open(path))
+              except:
+                  return None
 
-          echo "| DAST High findings | **${HIGH:-0}** |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "- Mode: **SECURITY_ENFORCE=${{ env.SECURITY_ENFORCE }}**" >> $GITHUB_STEP_SUMMARY
+          def write(line=""):
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write(line + "\n")
 
-          # Technical failure: staging deploy/test failed → always block
-          if [[ "$BLOCK" -gt 0 ]]; then
-            echo "### ❌ Gate FAILED — staging deploy/test failed (technical failure)" >> $GITHUB_STEP_SUMMARY
-            echo "passed=false" >> $GITHUB_OUTPUT
-            exit 1
-          fi
+          def set_output(key, val):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"{key}={val}\n")
 
-          # Security finding: DAST HIGH
-          if [[ "${HIGH:-0}" -gt 0 ]]; then
-            if [[ "${{ env.SECURITY_ENFORCE }}" == "true" ]]; then
-              echo "### ❌ Gate FAILED — DAST HIGH findings block production (enforcement mode)" >> $GITHUB_STEP_SUMMARY
-              echo "passed=false" >> $GITHUB_OUTPUT
-              exit 1
-            else
-              echo "### ⚠️ DAST HIGH findings detected but allowed in verification mode" >> $GITHUB_STEP_SUMMARY
-            fi
-          fi
+          art = "./artifacts"
 
-          echo "### ✅ Gate PASSED — continue to manual approve → production" >> $GITHUB_STEP_SUMMARY
-          echo "passed=true" >> $GITHUB_OUTPUT
-          exit 0
+          # ── Load evidence ──────────────────────────────────
+          deploy_data = load_json(f"{art}/staging-deployment-evidence/deploy-status.json")
+          smoke_data  = load_json(f"{art}/smoke-report/smoke-report.json")
+          perf_data   = load_json(f"{art}/perf-report/perf-report.json")
+          zap_data    = load_json(f"{art}/zap-summary/zap-summary.json")
 
-  # ═══════════════════════════════════════════════════════════
-  # MANUAL APPROVE
-  # Setup GitHub Environment "production" with required reviewers
-  # for real manual approval gate
-  # ═══════════════════════════════════════════════════════════
+          # ── Parse từng evidence ────────────────────────────
+          deploy_status = (deploy_data or {}).get("deploy_status", "unknown")
+          deploy_ok     = deploy_status == "success"
 
-  approve:
-    name: "Manual Approve"
+          smoke_status  = (smoke_data or {}).get("smoke_status", "unknown")
+          smoke_ok      = smoke_status == "passed"
+
+          error_rate    = (perf_data or {}).get("error_rate_pct", 100)
+          perf_ok       = perf_data is not None and int(error_rate) <= PERF_ERROR_THRESHOLD
+
+          zap_high      = (zap_data or {}).get("high",           -1)
+          zap_medium    = (zap_data or {}).get("medium",          0)
+          zap_low       = (zap_data or {}).get("low",             0)
+          zap_report_missing = (zap_data or {}).get("report_missing", True)
+          # zap_missing = không có file; zap_report_missing = file có nhưng ZAP không chạy được
+          zap_ok        = zap_data is not None \
+                          and not zap_report_missing \
+                          and zap_high == 0
+
+          # Missing report checks
+          deploy_missing = deploy_data is None
+          smoke_missing  = smoke_data  is None
+          perf_missing   = perf_data   is None
+          zap_missing    = zap_data    is None
+
+          # ── Gate Policy ────────────────────────────────────
+          block_reasons = []
+
+          if deploy_missing:
+              block_reasons.append("Deploy evidence report bị thiếu")
+          elif not deploy_ok:
+              block_reasons.append(f"Deploy staging thất bại (status={deploy_status})")
+
+          if smoke_missing:
+              block_reasons.append("Smoke test report bị thiếu")
+          elif not smoke_ok:
+              block_reasons.append(f"Smoke test failed (status={smoke_status})")
+
+          if perf_missing:
+              block_reasons.append("Performance test report bị thiếu")
+          elif not perf_ok:
+              block_reasons.append(
+                  f"Performance error rate {error_rate}% vượt threshold {PERF_ERROR_THRESHOLD}%"
+              )
+
+          if zap_missing:
+              block_reasons.append("ZAP DAST report bị thiếu hoàn toàn")
+          elif zap_report_missing:
+              block_reasons.append("ZAP không tạo được scan report — tunnel hoặc scan lỗi")
+          elif not zap_ok:
+              block_reasons.append(f"ZAP phát hiện {zap_high} HIGH finding(s)")
+
+          should_block = bool(block_reasons)
+
+          # ── Write Summary ──────────────────────────────────
+          write("# 🚦 Staging Gate")
+          write()
+
+          write("## Job Status")
+          write()
+          write("| Phase | Runner | Evidence |")
+          write("|-------|--------|----------|")
+          deploy_job = os.environ.get("DEPLOY_RESULT", "unknown")
+          dj_icon = "✅" if deploy_job == "success" else "❌"
+          write(f"| Deploy Staging | {dj_icon} {deploy_job} | — |")
+          write()
+
+          write("## Test Results")
+          write()
+          write("| Test | Status | Detail |")
+          write("|------|--------|--------|")
+
+          # Deploy
+          dp_icon = "✅" if deploy_ok else ("⚠️" if deploy_missing else "❌")
+          write(f"| Deploy | {dp_icon} {deploy_status} | {'—' if not deploy_missing else 'report missing'} |")
+
+          # Smoke
+          sm_icon = "✅" if smoke_ok else ("⚠️" if smoke_missing else "❌")
+          write(f"| Smoke Test | {sm_icon} {smoke_status} | {'—' if not smoke_missing else 'report missing'} |")
+
+          # Perf
+          pf_icon = "✅" if perf_ok else ("⚠️" if perf_missing else "❌")
+          pf_detail = f"error rate {error_rate}%" if not perf_missing else "report missing"
+          write(f"| Performance | {pf_icon} | {pf_detail} |")
+
+          # ZAP
+          if zap_missing:
+              zap_icon   = "⚠️"
+              zap_detail = "report missing"
+          elif zap_report_missing:
+              zap_icon   = "❌"
+              zap_detail = "ZAP scan không chạy được (tunnel/scan error)"
+          elif zap_ok:
+              zap_icon   = "✅"
+              zap_detail = f"HIGH={zap_high} MEDIUM={zap_medium} LOW={zap_low}"
+          else:
+              zap_icon   = "❌"
+              zap_detail = f"HIGH={zap_high} MEDIUM={zap_medium} LOW={zap_low}"
+          write(f"| DAST (ZAP) | {zap_icon} | {zap_detail} |")
+          write()
+
+          if not zap_missing and (zap_high > 0 or zap_medium > 0):
+              write("<details><summary>DAST Findings Detail</summary>")
+              write()
+              write("| Severity | Count | Gate Impact |")
+              write("|----------|-------|-------------|")
+              write(f"| 🔴 HIGH   | {zap_high}   | ← Block trigger |")
+              write(f"| 🟡 MEDIUM | {zap_medium} | Informational |")
+              write(f"| 🟢 LOW    | {zap_low}    | Informational |")
+              write("")
+              write("</details>")
+              write()
+
+          write("---")
+          write()
+          if should_block:
+              write("## ❌ Block — Không tiến hành production")
+              write()
+              write("Lý do:")
+              for r in block_reasons:
+                  write(f"- {r}")
+              set_output("passed", "false")
+          else:
+              write("## ✅ Allow — Tiến hành manual approval")
+              set_output("passed", "true")
+
+          write()
+          write("---")
+          write("*Evidence artifacts lưu 30 ngày.*")
+
+          if should_block:
+              print("\n❌ STAGING GATE FAILED:")
+              for r in block_reasons:
+                  print(f"  - {r}")
+              sys.exit(1)
+          else:
+              print("\n✅ STAGING GATE PASSED")
+
+          PYTHON_SCRIPT
+
+        env:
+          DEPLOY_RESULT: ${{ needs.deploy_staging.result }}
+
+
+# ============================================================
+# PHASE 5 — Manual Approval
+# Chỉ chạy nếu staging gate pass.
+# GitHub Environment "production" cần được cấu hình với reviewers.
+# ============================================================
+
+  manual_approval:
+    name: "Manual Approval"
     runs-on: ubuntu-latest
-    needs: [gate-staging]
-    if: needs.gate-staging.outputs.passed == 'true'
+    needs: [staging_gate]
+    if: needs.staging_gate.outputs.passed == 'true'
     environment:
-      name: production
+      name: production   # Cấu hình reviewers tại Settings → Environments
     steps:
       - name: Approved
-        run: echo "✅ Production deployment approved"
+        run: echo "✅ Production deployment approved by reviewer"
 
-  # ═══════════════════════════════════════════════════════════
-  # PRODUCTION — Canary deploy (simulate)
-  # Technical failures must fail this job — no soft wrapping
-  # ═══════════════════════════════════════════════════════════
+# ============================================================
+# PHASE 6 — Production Canary Deploy & Runtime Evidence
+# Chỉ chạy sau manual_approval pass.
+# Deploy theo canary simulate; rollback + ghi evidence nếu fail.
+# ============================================================
 
-  production:
-    name: "Production Deploy"
+  production_deploy:
+    name: "Production Deploy (Canary)"
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs: [approve, gate-staging]
-    if: needs.gate-staging.outputs.passed == 'true'
+    timeout-minutes: 30
+    needs: [manual_approval, staging_gate, verify_gate]
+    # Ba điều kiện phải đúng: staging gate pass + human approve + verify gate pass
+    if: >-
+      needs.staging_gate.outputs.passed == 'true' &&
+      needs.manual_approval.result == 'success' &&
+      needs.verify_gate.outputs.passed == 'true'
     permissions:
       contents: read
       packages: read
@@ -448,62 +911,163 @@ jobs:
           chmod 600 ~/.ssh/ec2_key.pem
           ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
 
-      - name: Copy k8s manifests to EC2
+      - name: Copy k8s production manifests
         run: |
           ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
             "mkdir -p /home/ubuntu/k8s-production"
           scp -i ~/.ssh/ec2_key.pem -r k8s/production/*.yaml \
             ubuntu@${{ secrets.EC2_HOST }}:/home/ubuntu/k8s-production/
 
-      - name: Deploy production (Canary simulate)
+      - name: Deploy production — apply manifests
+        id: prod_deploy
         run: |
-          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
+          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
+            IMAGE="${{ env.IMAGE_NAME }}@${{ needs.verify_gate.outputs.digest }}" \
+            ACTOR="${{ github.actor }}" \
+            TOKEN="${{ secrets.GITHUB_TOKEN }}" \
+            bash << 'REMOTE'
             set -e
-
-            echo "${{ secrets.GITHUB_TOKEN }}" \
-              | docker login ghcr.io \
-              -u ${{ github.actor }} --password-stdin
+            echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
 
             kind get clusters | grep -q staging \
               || { echo "❌ cluster not found"; exit 1; }
-
             kind export kubeconfig --name staging
 
-            docker pull --platform linux/amd64 \
-              ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}
-            kind load docker-image \
-              ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
-              --name staging
+            # Deploy bằng digest (immutable) — cùng mindset supply chain với staging
+            docker pull --platform linux/amd64 "$IMAGE"
+            kind load docker-image "$IMAGE" --name staging
 
             kubectl apply -f /home/ubuntu/k8s-production/namespace.yaml
             kubectl apply -f /home/ubuntu/k8s-production/postgres.yaml
-
-            sed "s|IMAGE_PLACEHOLDER|${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}|g" \
-              /home/ubuntu/k8s-production/app.yaml \
-              | kubectl apply -f -
+            sed "s|IMAGE_PLACEHOLDER|${IMAGE}|g" \
+              /home/ubuntu/k8s-production/app.yaml | kubectl apply -f -
 
             kubectl rollout status deployment/postgres \
               -n production --timeout=120s
             kubectl rollout status deployment/restaurant-app \
               -n production --timeout=180s
 
-            # Canary simulate: 1 replica → 2 → 3
-            echo "Canary 5% → 50% → 100%..."
-            kubectl scale deployment/restaurant-app --replicas=1 -n production
-            sleep 5
-            kubectl scale deployment/restaurant-app --replicas=2 -n production
-            sleep 5
-            kubectl scale deployment/restaurant-app --replicas=3 -n production
+            echo "✅ Base deploy done"
+          REMOTE
+        continue-on-error: true
 
-            echo "✅ Production deployed"
-          ENDSSH
-
-      - name: Production smoke test
+      - name: Canary simulate — scale 1→2→3 replicas
+        id: canary
+        if: always()
         run: |
-          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
-            set -e
-            kind export kubeconfig --name staging
+          mkdir -p prod-canary
+          CANARY_STATUS="completed"
+          STAGES_DONE="[]"
 
+          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
+            bash << 'REMOTE' > prod-canary/canary-raw.txt 2>&1 || true
+            kind export kubeconfig --name staging 2>/dev/null || true
+
+            echo "stage_1_start"
+            kubectl scale deployment/restaurant-app --replicas=1 -n production || exit 1
+            sleep 10
+            echo "stage_1_done"
+
+            echo "stage_2_start"
+            kubectl scale deployment/restaurant-app --replicas=2 -n production || exit 1
+            sleep 10
+            echo "stage_2_done"
+
+            echo "stage_3_start"
+            kubectl scale deployment/restaurant-app --replicas=3 -n production || exit 1
+            sleep 5
+            echo "stage_3_done"
+
+            kubectl get pods -n production
+          REMOTE
+
+          # Parse stages hoàn thành từ output
+          S1=$(grep -c "stage_1_done" prod-canary/canary-raw.txt || echo 0)
+          S2=$(grep -c "stage_2_done" prod-canary/canary-raw.txt || echo 0)
+          S3=$(grep -c "stage_3_done" prod-canary/canary-raw.txt || echo 0)
+
+          if [ "$S3" -gt 0 ]; then
+            CANARY_STATUS="completed"
+            STAGES_DONE='["1-replica-5pct","2-replica-50pct","3-replica-100pct"]'
+          elif [ "$S2" -gt 0 ]; then
+            CANARY_STATUS="partial"
+            STAGES_DONE='["1-replica-5pct","2-replica-50pct"]'
+          elif [ "$S1" -gt 0 ]; then
+            CANARY_STATUS="partial"
+            STAGES_DONE='["1-replica-5pct"]'
+          else
+            CANARY_STATUS="failed"
+            STAGES_DONE='[]'
+          fi
+
+          echo "{\"canary_status\":\"${CANARY_STATUS}\",\"stages_completed\":${STAGES_DONE}}" \
+            > prod-canary/canary-report.json
+          cat prod-canary/canary-report.json
+
+        continue-on-error: true
+
+      - name: Collect production deploy evidence
+        if: always()
+        run: |
+          mkdir -p prod-evidence
+
+          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
+            bash << 'REMOTE' > prod-evidence/kubectl-state.txt 2>&1 || true
+            kind export kubeconfig --name staging 2>/dev/null || true
+            echo "=== Deployments ==="
+            kubectl get deploy -n production -o wide 2>/dev/null || echo "N/A"
+            echo "=== Pods ==="
+            kubectl get pods -n production -o wide 2>/dev/null || echo "N/A"
+            echo "=== Services ==="
+            kubectl get svc -n production 2>/dev/null || echo "N/A"
+          REMOTE
+
+          # Rollout history
+          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
+            "kind export kubeconfig --name staging 2>/dev/null; \
+             kubectl rollout history deployment/restaurant-app -n production 2>/dev/null || echo 'N/A'" \
+            > prod-evidence/production-rollout-history.txt 2>&1 || true
+
+          # Events
+          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
+            "kind export kubeconfig --name staging 2>/dev/null; \
+             kubectl get events -n production --sort-by=.metadata.creationTimestamp 2>/dev/null \
+             | tail -20 || echo 'N/A'" \
+            > prod-evidence/production-events.txt 2>&1 || true
+
+          # Deploy status JSON — dùng digest (immutable) trong image field
+          DEPLOY_EXIT="${{ steps.prod_deploy.outcome }}"
+          [ "$DEPLOY_EXIT" = "success" ] \
+            && DEPLOY_STATUS="success" \
+            || DEPLOY_STATUS="failed"
+          DEPLOYED_IMAGE="${{ env.IMAGE_NAME }}@${{ needs.verify_gate.outputs.digest }}"
+          echo "{\"deploy_status\":\"${DEPLOY_STATUS}\",\"image\":\"${DEPLOYED_IMAGE}\"}" \
+            > prod-evidence/production-deploy-report.json
+
+          # Gộp canary report vào prod-evidence
+          [ -f prod-canary/canary-report.json ] \
+            && cp prod-canary/canary-report.json prod-evidence/canary-report.json \
+            || echo '{"canary_status":"unknown","stages_completed":[]}' \
+               > prod-evidence/canary-report.json
+
+      - name: Upload artifact — production-deploy-report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-deploy-report
+          path: prod-evidence/
+          retention-days: 30
+
+      # ── Production Smoke Test + Rollback nếu fail ──────────
+      - name: Production smoke test
+        id: prod_smoke
+        if: always()
+        run: |
+          mkdir -p prod-smoke-out
+
+          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
+            bash << 'REMOTE' > prod-smoke-out/prod-smoke-raw.txt 2>&1 || true
+            kind export kubeconfig --name staging 2>/dev/null || true
             pkill -f "kubectl port-forward.*18001" || true
             sleep 2
 
@@ -511,32 +1075,244 @@ jobs:
               -n production > /tmp/pf-prod.log 2>&1 &
             sleep 8
 
+            SMOKE_STATUS="failed"
             for i in $(seq 1 12); do
-              if curl -sf http://localhost:18001/docs > /dev/null; then
-                echo "✅ Production healthy"
+              if curl -sf http://localhost:18001/docs > /dev/null 2>&1; then
+                SMOKE_STATUS="passed"
                 break
               fi
-              [[ $i -eq 12 ]] && {
-                echo "❌ Production unhealthy — initiating rollback"
-                kubectl rollout undo deployment/restaurant-app -n production
-                exit 1
-              }
               sleep 5
             done
 
+            echo "prod_smoke_status=${SMOKE_STATUS}"
             pkill -f "kubectl port-forward.*18001" || true
-          ENDSSH
+          REMOTE
 
-  # ═══════════════════════════════════════════════════════════
-  # OBSERVABILITY
-  # ═══════════════════════════════════════════════════════════
+          SMOKE=$(grep "prod_smoke_status=" prod-smoke-out/prod-smoke-raw.txt \
+            | tail -1 | cut -d= -f2 || echo "failed")
+          echo "{\"smoke_status\":\"${SMOKE}\"}" \
+            > prod-smoke-out/production-smoke-report.json
+          echo "Production smoke: $SMOKE"
 
-  observability:
-    name: "Observability"
+        continue-on-error: true
+
+      - name: Upload artifact — production-smoke-report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-smoke-report
+          path: prod-smoke-out/production-smoke-report.json
+          retention-days: 30
+
+      - name: Rollback nếu smoke fail
+        if: always()
+        run: |
+          mkdir -p rollback-out
+
+          SMOKE=$(python3 -c "
+          import json
+          try:
+              d = json.load(open('prod-smoke-out/production-smoke-report.json'))
+              print(d.get('smoke_status','failed'))
+          except:
+              print('failed')
+          " || echo "failed")
+
+          if [ "$SMOKE" = "failed" ]; then
+            echo "Production smoke failed — executing rollback"
+            ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
+              "kind export kubeconfig --name staging 2>/dev/null; \
+               kubectl rollout undo deployment/restaurant-app -n production" \
+              >> rollback-out/rollback-record.txt 2>&1 || true
+            echo "rollback_happened=true"  >> rollback-out/rollback-record.txt
+            echo "rollback_reason=production smoke test failed" >> rollback-out/rollback-record.txt
+          else
+            echo "rollback_happened=false" > rollback-out/rollback-record.txt
+            echo "No rollback needed"
+          fi
+
+        continue-on-error: true
+
+      - name: Upload artifact — rollback-record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rollback-record
+          path: rollback-out/rollback-record.txt
+          retention-days: 30
+
+
+# ============================================================
+# PHASE 7 — Production Gate
+# Parse production evidence → quyết định Stable Release / fail.
+# ============================================================
+
+  production_gate:
+    name: "Production Gate"
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [production]
-    if: needs.production.result == 'success'
+    needs: [production_deploy]
+    if: always() && needs.production_deploy.result != 'skipped'
+    outputs:
+      passed: ${{ steps.gate.outputs.passed }}
+    steps:
+      - name: Download production artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+        continue-on-error: true
+
+      - name: Parse & quyết định Production Gate
+        id: gate
+        run: |
+          python3 << 'PYTHON_SCRIPT'
+          import json, os, sys
+
+          def load_json(path):
+              try:
+                  return json.load(open(path))
+              except:
+                  return None
+
+          def read_file(path, default=""):
+              try:
+                  return open(path).read()
+              except:
+                  return default
+
+          def write(line=""):
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write(line + "\n")
+
+          def set_output(key, val):
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"{key}={val}\n")
+
+          art = "./artifacts"
+
+          # ── Load evidence ──────────────────────────────────
+          deploy_data  = load_json(f"{art}/production-deploy-report/production-deploy-report.json")
+          smoke_data   = load_json(f"{art}/production-smoke-report/production-smoke-report.json")
+          canary_data  = load_json(f"{art}/production-deploy-report/canary-report.json")
+          rollback_txt = read_file(f"{art}/rollback-record/rollback-record.txt")
+          history_txt  = read_file(f"{art}/production-deploy-report/production-rollout-history.txt")
+
+          # ── Parse ──────────────────────────────────────────
+          deploy_status   = (deploy_data  or {}).get("deploy_status", "unknown")
+          deploy_ok       = deploy_status == "success"
+          deploy_missing  = deploy_data is None
+
+          smoke_status    = (smoke_data   or {}).get("smoke_status",  "unknown")
+          smoke_ok        = smoke_status == "passed"
+          smoke_missing   = smoke_data is None
+
+          canary_status = (canary_data or {}).get("canary_status", "unknown")
+          canary_stages = (canary_data or {}).get("stages_completed", [])
+          canary_ok     = canary_status == "completed"
+
+          rollback_missing = not rollback_txt
+          rollback_happened = "rollback_happened=true" in rollback_txt if rollback_txt else False
+
+          # ── Gate Policy ────────────────────────────────────
+          block_reasons = []
+
+          if deploy_missing:
+              block_reasons.append("Production deploy report bị thiếu")
+          elif not deploy_ok:
+              block_reasons.append(f"Production deploy thất bại (status={deploy_status})")
+
+          if smoke_missing:
+              block_reasons.append("Production smoke report bị thiếu")
+          elif not smoke_ok:
+              block_reasons.append(f"Production smoke test failed (status={smoke_status})")
+
+          if canary_data is None:
+              block_reasons.append("Canary report bị thiếu")
+          elif not canary_ok:
+              block_reasons.append(f"Canary rollout không hoàn tất (status={canary_status})")
+
+          if rollback_missing:
+              block_reasons.append("Rollback record bị thiếu")
+          elif rollback_happened:
+              block_reasons.append("Rollback đã xảy ra — production không stable")
+
+          should_block = bool(block_reasons)
+
+          # ── Write Summary ──────────────────────────────────
+          write("# 🏭 Production Gate")
+          write()
+          write("## Production Evidence")
+          write()
+          write("| Check | Status | Detail |")
+          write("|-------|--------|--------|")
+
+          dp_icon = "✅" if deploy_ok else ("⚠️" if deploy_missing else "❌")
+          write(f"| Deploy | {dp_icon} {deploy_status} | {'—' if not deploy_missing else 'report missing'} |")
+
+          sm_icon = "✅" if smoke_ok else ("⚠️" if smoke_missing else "❌")
+          write(f"| Smoke Test | {sm_icon} {smoke_status} | {'—' if not smoke_missing else 'report missing'} |")
+
+          # Canary
+          cn_icon = "✅" if canary_ok else ("⚠️" if canary_data is None else "❌")
+          cn_detail = f"stages: {canary_stages}" if canary_data else "report missing"
+          write(f"| Canary Simulate | {cn_icon} {canary_status} | {cn_detail} |")
+
+          rb_icon = "✅" if (not rollback_happened and not rollback_missing) else "❌"
+          rb_detail = "No rollback" if not rollback_happened else "⚠️ Rollback executed"
+          if rollback_missing:
+              rb_detail = "record missing"
+          write(f"| Rollback | {rb_icon} | {rb_detail} |")
+          write()
+
+          if history_txt:
+              write("<details><summary>Rollout History</summary>")
+              write()
+              write("```")
+              write(history_txt[:500])
+              write("```")
+              write("")
+              write("</details>")
+              write()
+
+          write("---")
+          write()
+          if should_block:
+              write("## ❌ Production Deploy FAILED")
+              write()
+              write("Lý do:")
+              for r in block_reasons:
+                  write(f"- {r}")
+              set_output("passed", "false")
+          else:
+              write("## ✅ Stable Release — Production healthy")
+              set_output("passed", "true")
+
+          write()
+          write("---")
+          write("*Evidence artifacts lưu 30 ngày.*")
+
+          if should_block:
+              print("\n❌ PRODUCTION GATE FAILED:")
+              for r in block_reasons:
+                  print(f"  - {r}")
+              sys.exit(1)
+          else:
+              print("\n✅ PRODUCTION GATE PASSED — Stable Release")
+
+          PYTHON_SCRIPT
+
+
+# ============================================================
+# PHASE 8 — Observability & Runtime Security Evidence
+# Informational; Falco fail không block pipeline.
+# ============================================================
+
+  observability:
+    name: "Observability & Runtime Security"
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [production_gate]
+    if: needs.production_gate.outputs.passed == 'true'
     steps:
       - name: Setup SSH
         run: |
@@ -545,76 +1321,214 @@ jobs:
           chmod 600 ~/.ssh/ec2_key.pem
           ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
 
-      - name: Check Falco
+      - name: Collect runtime evidence
         run: |
-          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
-            if command -v falco &>/dev/null; then
-              echo "✅ Falco installed"
-              sudo systemctl status falco --no-pager | head -5 || true
-            else
-              echo "⚠️ Falco not installed — skipped in verification mode"
-              echo "   To enable runtime security, install Falco on EC2 manually."
-            fi
-          ENDSSH
+          mkdir -p obs-out
+
+          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
+            bash << 'REMOTE' > obs-out/observability-report.txt 2>&1 || true
+            kind export kubeconfig --name staging 2>/dev/null || true
+
+            echo "=== Production Pods ==="
+            kubectl get pods -n production -o wide 2>/dev/null || echo "N/A"
+
+            echo "=== Production Services ==="
+            kubectl get svc -n production 2>/dev/null || echo "N/A"
+
+            echo "=== Recent Events ==="
+            kubectl get events -n production \
+              --sort-by=.metadata.creationTimestamp 2>/dev/null \
+              | tail -20 || echo "N/A"
+
+            echo "=== App Logs (last 50 lines) ==="
+            kubectl logs -l app=restaurant-app -n production \
+              --tail=50 2>/dev/null || echo "N/A"
+          REMOTE
+
         continue-on-error: true
 
-      - name: Production health check
-        run: |
-          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} << 'ENDSSH'
-            kind export kubeconfig --name staging
-            echo "=== Production Pods ==="
-            kubectl get pods -n production
-            echo "=== Production Services ==="
-            kubectl get svc -n production
-            echo "✅ Observability check complete"
-          ENDSSH
-
-      - name: Write Observability summary
+      - name: Upload artifact — observability-report
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: observability-report
+          path: obs-out/observability-report.txt
+          retention-days: 30
+
+      - name: Check Falco status (best-effort)
+        # Falco fail không block pipeline — chỉ ghi status
         run: |
-          echo "## 👁️ Observability" >> $GITHUB_STEP_SUMMARY
-          echo "- Production pod/service inventory collected" >> $GITHUB_STEP_SUMMARY
-          echo "- Falco: checked (skipped if not installed in verification mode)" >> $GITHUB_STEP_SUMMARY
+          mkdir -p falco-out
 
-  # ═══════════════════════════════════════════════════════════
-  # AUDIT
-  # ═══════════════════════════════════════════════════════════
+          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
+            bash << 'REMOTE' > falco-out/falco-status-report.txt 2>&1 || true
+            if command -v falco &>/dev/null; then
+              echo "falco_installed=true"
+              sudo systemctl status falco --no-pager 2>/dev/null | head -10 || true
 
-  audit:
-    name: "Audit"
+              # Lấy events gần nhất nếu log file tồn tại
+              FALCO_LOG="/var/log/falco/falco.log"
+              if [ -f "$FALCO_LOG" ]; then
+                echo "=== Recent Falco Events ==="
+                sudo tail -20 "$FALCO_LOG" 2>/dev/null || true
+              fi
+            else
+              echo "falco_installed=false"
+              echo "Falco not installed — skipped (informational only)"
+              echo "To install: see https://falco.org/docs/getting-started/installation/"
+            fi
+          REMOTE
+
+        continue-on-error: true
+
+      - name: Upload artifact — falco-status-report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: falco-status-report
+          path: falco-out/falco-status-report.txt
+          retention-days: 30
+
+
+# ============================================================
+# PHASE 9 — CD Audit Summary
+# Luôn chạy; không fail pipeline.
+# Tổng hợp toàn bộ evidence cho audit.
+# ============================================================
+
+  cd_summary:
+    name: "CD Audit Summary"
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [verify, staging, gate-staging, production, observability]
+    needs:
+      - verify_gate
+      - staging_gate
+      - manual_approval
+      - production_gate
+      - observability
     if: always()
     steps:
-      - name: CD Summary
+      - name: Download artifacts để lấy ZAP và digest
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+        continue-on-error: true
+
+      - name: Ghi CD Audit Summary
         run: |
-          echo "## 🚀 CD Pipeline Audit Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Pipeline Stages" >> $GITHUB_STEP_SUMMARY
-          echo "| Phase | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| Verify Image   | ${{ needs.verify.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Staging        | ${{ needs.staging.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Gate Staging   | ${{ needs.gate-staging.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Production     | ${{ needs.production.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Observability  | ${{ needs.observability.result }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### DAST Findings (Staging)" >> $GITHUB_STEP_SUMMARY
-          echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-          echo "| 🔴 High   | ${{ needs.staging.outputs.dast_high || 0 }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 🟡 Medium | ${{ needs.staging.outputs.dast_medium || 0 }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| 🟢 Low    | ${{ needs.staging.outputs.dast_low || 0 }} |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Artifact Info" >> $GITHUB_STEP_SUMMARY
-          echo "- **Image:** \`${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Mode" >> $GITHUB_STEP_SUMMARY
-          echo "- **SECURITY_ENFORCE:** \`${{ env.SECURITY_ENFORCE }}\`" >> $GITHUB_STEP_SUMMARY
-          if [[ "${{ env.SECURITY_ENFORCE }}" == "false" ]]; then
-            echo "- ⚠️ **Note:** Security findings are collected but not blocking in verification mode." >> $GITHUB_STEP_SUMMARY
-            echo "- To enable enforcement, set \`SECURITY_ENFORCE: \"true\"\` in the workflow env." >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- 🔒 Enforcement mode active — security gates are blocking." >> $GITHUB_STEP_SUMMARY
-          fi
+          python3 << 'PYTHON_SCRIPT'
+          import json, os
+
+          def write(line=""):
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write(line + "\n")
+
+          def load_json(path):
+              try:
+                  return json.load(open(path))
+              except:
+                  return None
+
+          def read_file(path, default="N/A"):
+              try:
+                  return open(path).read().strip()
+              except:
+                  return default
+
+          def result_icon(r):
+              if r == "success":  return "✅"
+              if r == "skipped":  return "⏭️"
+              if r == "failure":  return "❌"
+              return "⚠️"
+
+          # ── Env vars ───────────────────────────────────────
+          verify_r  = os.environ.get("VERIFY_RESULT",  "unknown")
+          staging_r = os.environ.get("STAGING_RESULT", "unknown")
+          approve_r = os.environ.get("APPROVE_RESULT", "unknown")
+          prod_r    = os.environ.get("PROD_RESULT",    "unknown")
+          obs_r     = os.environ.get("OBS_RESULT",     "unknown")
+          image_tag = os.environ.get("IMAGE_TAG",  "unknown")
+          image_name= os.environ.get("IMAGE_NAME", "unknown")
+          sha       = os.environ.get("SHA", "")
+
+          art = "./artifacts"
+          digest    = read_file(f"{art}/image-digest/image-digest.txt")
+          zap_data  = load_json(f"{art}/zap-summary/zap-summary.json")
+          rollback_txt = read_file(f"{art}/rollback-record/rollback-record.txt", "")
+
+          zap_high   = (zap_data or {}).get("high",   "N/A")
+          zap_medium = (zap_data or {}).get("medium", "N/A")
+          zap_low    = (zap_data or {}).get("low",    "N/A")
+          rollback_happened = "rollback_happened=true" in rollback_txt
+
+          # ── Summary ────────────────────────────────────────
+          write("# 🚀 CD Audit Summary")
+          write()
+          write(f"**Run**: `{os.environ.get('GITHUB_RUN_ID','N/A')}`  ")
+          write(f"**Branch**: `release`  ")
+          write(f"**Commit**: `{sha[:8] if sha else 'N/A'}`")
+          write()
+
+          write("## Pipeline Result")
+          write()
+          write("| Phase | Job | Result |")
+          write("|-------|-----|--------|")
+          write(f"| Phase 1+2 | Verify Gate         | {result_icon(verify_r)} {verify_r} |")
+          write(f"| Phase 3+4 | Staging Gate        | {result_icon(staging_r)} {staging_r} |")
+          write(f"| Phase 5   | Manual Approval     | {result_icon(approve_r)} {approve_r} |")
+          write(f"| Phase 6+7 | Production Gate     | {result_icon(prod_r)} {prod_r} |")
+          write(f"| Phase 8   | Observability       | {result_icon(obs_r)} {obs_r} |")
+          write()
+
+          write("## Artifact Info")
+          write()
+          write(f"- **Image** : `{image_name}:{image_tag}`")
+          write(f"- **Digest**: `{digest}`")
+          write()
+
+          write("## DAST Summary")
+          write()
+          write("| Severity | Count |")
+          write("|----------|-------|")
+          write(f"| 🔴 HIGH   | {zap_high} |")
+          write(f"| 🟡 MEDIUM | {zap_medium} |")
+          write(f"| 🟢 LOW    | {zap_low} |")
+          write()
+
+          write(f"**Rollback occurred**: {'⚠️ Yes' if rollback_happened else '✅ No'}")
+          write()
+
+          write("## Evidence Artifacts (lưu 30 ngày)")
+          write()
+          write("| Artifact | Nội dung |")
+          write("|----------|----------|")
+          write("| `image-digest`              | Resolved image digest |")
+          write("| `cosign-verify-report`      | Cosign signature verify result |")
+          write("| `sbom-attestation-report`   | SBOM attestation status |")
+          write("| `verify-artifact-report`    | Tổng hợp verify evidence JSON |")
+          write("| `staging-deployment-evidence` | kubectl state + deploy status |")
+          write("| `smoke-report`              | Staging smoke test result |")
+          write("| `perf-report`               | Performance test (100 req) result |")
+          write("| `zap-report`                | OWASP ZAP full report |")
+          write("| `zap-summary`               | ZAP HIGH/MEDIUM/LOW counts |")
+          write("| `production-deploy-report`  | Production deploy + events |")
+          write("| `production-smoke-report`   | Production smoke test result |")
+          write("| `rollback-record`           | Rollback history nếu có |")
+          write("| `observability-report`      | Runtime kubectl state + logs |")
+          write("| `falco-status-report`       | Falco runtime security status |")
+          write()
+          write("---")
+          write("*Tất cả artifacts có thể dùng làm audit evidence.*")
+
+          PYTHON_SCRIPT
+
+        env:
+          VERIFY_RESULT:  ${{ needs.verify_gate.result }}
+          STAGING_RESULT: ${{ needs.staging_gate.result }}
+          APPROVE_RESULT: ${{ needs.manual_approval.result }}
+          PROD_RESULT:    ${{ needs.production_gate.result }}
+          OBS_RESULT:     ${{ needs.observability.result }}
+          IMAGE_TAG:      ${{ env.IMAGE_TAG }}
+          IMAGE_NAME:     ${{ env.IMAGE_NAME }}
+          SHA:            ${{ github.sha }}
+          GITHUB_RUN_ID:  ${{ github.run_id }}
