@@ -376,7 +376,6 @@ jobs:
           set +e
           ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
             IMAGE="${{ env.IMAGE_NAME }}@${{ needs.verify_gate.outputs.digest }}" \
-            LOCAL_IMAGE="restaurant-app:staging-${{ github.sha }}" \
             ACTOR="${{ github.actor }}" \
             TOKEN="${{ secrets.GITHUB_TOKEN }}" \
             bash << 'REMOTE'
@@ -386,10 +385,7 @@ jobs:
 
             kind get clusters | grep -q staging \
               || { echo "❌ staging cluster not found"; exit 1; }
-            kind export kubeconfig --name staging
 
-            kind get clusters | grep -q staging \
-              || { echo "❌ staging cluster not found"; exit 1; }
             kind export kubeconfig --name staging
 
             kubectl delete namespace staging --ignore-not-found=true
@@ -407,31 +403,17 @@ jobs:
 
             kubectl apply -f /home/ubuntu/k8s-staging/postgres.yaml
 
-            # Deploy trực tiếp bằng digest đã verify
+            # Deploy trực tiếp bằng digest đã được Verify Gate kiểm tra
             sed "s|IMAGE_PLACEHOLDER|${IMAGE}|g" \
               /home/ubuntu/k8s-staging/app.yaml | kubectl apply -f -
 
             kubectl rollout status deployment/postgres \
               -n staging --timeout=120s
+
             kubectl rollout status deployment/restaurant-app \
               -n staging --timeout=180s
 
             echo "✅ Deployed to staging with verified digest: $IMAGE"
-
-            kubectl delete namespace staging --ignore-not-found=true
-            sleep 3
-            kubectl apply -f /home/ubuntu/k8s-staging/namespace.yaml
-            kubectl apply -f /home/ubuntu/k8s-staging/postgres.yaml
-
-            sed "s|IMAGE_PLACEHOLDER|${LOCAL_IMAGE}|g" \
-              /home/ubuntu/k8s-staging/app.yaml | kubectl apply -f -
-
-            kubectl rollout status deployment/postgres \
-              -n staging --timeout=120s
-            kubectl rollout status deployment/restaurant-app \
-              -n staging --timeout=180s
-
-            echo "✅ Deployed to staging with local image: $LOCAL_IMAGE"
           REMOTE
 
           DEPLOY_EXIT=$?
@@ -1005,7 +987,6 @@ jobs:
         run: |
           ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
             IMAGE="${{ env.IMAGE_NAME }}@${{ needs.verify_gate.outputs.digest }}" \
-            LOCAL_IMAGE="restaurant-app:production-${{ github.sha }}" \
             ACTOR="${{ github.actor }}" \
             TOKEN="${{ secrets.GITHUB_TOKEN }}" \
             bash << 'REMOTE'
@@ -1015,12 +996,7 @@ jobs:
 
             kind get clusters | grep -q staging \
               || { echo "❌ cluster not found"; exit 1; }
-            kind export kubeconfig --name staging
 
-            echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
-
-            kind get clusters | grep -q staging \
-              || { echo "❌ cluster not found"; exit 1; }
             kind export kubeconfig --name staging
 
             kubectl apply -f /home/ubuntu/k8s-production/namespace.yaml
@@ -1039,23 +1015,11 @@ jobs:
 
             kubectl rollout status deployment/postgres \
               -n production --timeout=120s
+
             kubectl rollout status deployment/restaurant-app \
               -n production --timeout=180s
 
             echo "✅ Production deployed with verified digest: $IMAGE"
-
-            kubectl apply -f /home/ubuntu/k8s-production/namespace.yaml
-            kubectl apply -f /home/ubuntu/k8s-production/postgres.yaml
-
-            sed "s|IMAGE_PLACEHOLDER|${LOCAL_IMAGE}|g" \
-              /home/ubuntu/k8s-production/app.yaml | kubectl apply -f -
-
-            kubectl rollout status deployment/postgres \
-              -n production --timeout=120s
-            kubectl rollout status deployment/restaurant-app \
-              -n production --timeout=180s
-
-            echo "✅ Base deploy done with local image: $LOCAL_IMAGE"
           REMOTE
         continue-on-error: true
 
