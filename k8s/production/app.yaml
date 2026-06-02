@@ -26,6 +26,8 @@ spec:
       labels:
         app: restaurant-app
     spec:
+      imagePullSecrets:
+        - name: ghcr-secret
       containers:
         - name: app
           image: IMAGE_PLACEHOLDER

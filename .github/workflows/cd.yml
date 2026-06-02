@@ -388,14 +388,35 @@ jobs:
               || { echo "❌ staging cluster not found"; exit 1; }
             kind export kubeconfig --name staging
 
-            # Pull artifact đã verify theo digest
-            docker pull --platform linux/amd64 "$IMAGE"
+            kind get clusters | grep -q staging \
+              || { echo "❌ staging cluster not found"; exit 1; }
+            kind export kubeconfig --name staging
 
-            # Tag lại thành local image tag để kind load ổn định hơn
-            docker tag "$IMAGE" "$LOCAL_IMAGE"
+            kubectl delete namespace staging --ignore-not-found=true
+            sleep 3
 
-            # Load local tag vào kind, không load trực tiếp repo@sha256
-            kind load docker-image "$LOCAL_IMAGE" --name staging
+            kubectl apply -f /home/ubuntu/k8s-staging/namespace.yaml
+
+            # Tạo GHCR pull secret trong namespace staging
+            kubectl create secret docker-registry ghcr-secret \
+              --docker-server=ghcr.io \
+              --docker-username="$ACTOR" \
+              --docker-password="$TOKEN" \
+              -n staging \
+              --dry-run=client -o yaml | kubectl apply -f -
+
+            kubectl apply -f /home/ubuntu/k8s-staging/postgres.yaml
+
+            # Deploy trực tiếp bằng digest đã verify
+            sed "s|IMAGE_PLACEHOLDER|${IMAGE}|g" \
+              /home/ubuntu/k8s-staging/app.yaml | kubectl apply -f -
+
+            kubectl rollout status deployment/postgres \
+              -n staging --timeout=120s
+            kubectl rollout status deployment/restaurant-app \
+              -n staging --timeout=180s
+
+            echo "✅ Deployed to staging with verified digest: $IMAGE"
 
             kubectl delete namespace staging --ignore-not-found=true
             sleep 3
@@ -544,38 +565,83 @@ jobs:
 
       # ── DAST RC — OWASP ZAP ───────────────────────────────
       - name: Expose staging app for DAST
+        id: expose_dast
         if: always()
         run: |
-          # Port-forward trên EC2 bind 0.0.0.0 để runner tunnel được
-          ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
-            "kind export kubeconfig --name staging 2>/dev/null || true; \
-             pkill -f 'kubectl port-forward.*18000' || true; sleep 1; \
-             nohup kubectl port-forward svc/restaurant-app 18000:8000 \
-               -n staging --address 0.0.0.0 > /tmp/pf-dast.log 2>&1 &"
+          mkdir -p dast-out
 
-          # SSH tunnel: runner:8000 → EC2:18000
+          set +e
+
+          echo "Starting remote port-forward on EC2..."
+
           ssh -i ~/.ssh/ec2_key.pem \
-            -L 8000:localhost:18000 \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=3 \
+            ubuntu@${{ secrets.EC2_HOST }} \
+            "kind export kubeconfig --name staging 2>/dev/null || true; \
+            pkill -f 'kubectl port-forward.*18000' || true; \
+            sleep 2; \
+            nohup kubectl port-forward svc/restaurant-app 18000:8000 \
+              -n staging --address 127.0.0.1 > /tmp/pf-dast.log 2>&1 & \
+            sleep 5; \
+            curl -sf http://127.0.0.1:18000/docs >/dev/null" \
+            > dast-out/remote-portforward.txt 2>&1
+
+          REMOTE_EXIT=$?
+
+          echo "Starting SSH tunnel runner:8000 -> EC2:18000..."
+
+          ssh -i ~/.ssh/ec2_key.pem \
+            -o ExitOnForwardFailure=yes \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=3 \
+            -L 8000:127.0.0.1:18000 \
             -N -f \
             ubuntu@${{ secrets.EC2_HOST }} \
-            || true
-          sleep 8
-          curl -sf http://localhost:8000/docs \
-            && echo "Tunnel ready" \
-            || echo "WARNING: tunnel may not be ready"
+            > dast-out/ssh-tunnel.txt 2>&1
 
+          TUNNEL_EXIT=$?
+
+          sleep 5
+
+          curl -sf http://127.0.0.1:8000/docs >/dev/null
+          LOCAL_EXIT=$?
+
+          if [ "$REMOTE_EXIT" = "0" ] && [ "$TUNNEL_EXIT" = "0" ] && [ "$LOCAL_EXIT" = "0" ]; then
+            echo '{"expose_status":"success","target":"http://127.0.0.1:8000"}' > dast-out/expose-status.json
+            echo "✅ DAST target ready: http://127.0.0.1:8000"
+          else
+            echo "{\"expose_status\":\"failed\",\"remote_exit\":${REMOTE_EXIT},\"tunnel_exit\":${TUNNEL_EXIT},\"local_exit\":${LOCAL_EXIT}}" > dast-out/expose-status.json
+            echo "❌ DAST target not ready"
+            cat dast-out/remote-portforward.txt || true
+            cat dast-out/ssh-tunnel.txt || true
+          fi
+
+          exit 0
         continue-on-error: true
-
+      - name: Upload artifact — dast-expose-status
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dast-expose-status
+          path: dast-out/
+          retention-days: 30
+      - name: Prepare workspace for ZAP
+        if: always()
+        run: |
+          sudo chmod -R a+rwX "$GITHUB_WORKSPACE"
+          touch report_json.json report_md.md report_html.html
+          chmod a+rw report_json.json report_md.md report_html.html
       - name: DAST — OWASP ZAP baseline
         id: zap
         if: always()
         uses: zaproxy/action-baseline@v0.12.0
         with:
-          target:          "http://localhost:8000"
+          target: "http://127.0.0.1:8000"
           rules_file_name: ".zap/rules.tsv"
-          cmd_options:     "-a"
-          fail_action:     false          # KHÔNG fail job; gate quyết định
-          artifact_name:   zap-report
+          cmd_options: "-a"
+          fail_action: false
+          artifact_name: zap-report
         continue-on-error: true
 
       - name: Parse ZAP results & write summary JSON
@@ -584,36 +650,55 @@ jobs:
         run: |
           mkdir -p zap-out
 
+          EXPOSE_STATUS="unknown"
+          if [ -f "dast-out/expose-status.json" ]; then
+            EXPOSE_STATUS=$(python3 -c "
+              import json
+              try:
+                  d=json.load(open('dast-out/expose-status.json'))
+                  print(d.get('expose_status','unknown'))
+              except:
+                  print('unknown')
+              ")
+          fi
+
+          if [ "$EXPOSE_STATUS" != "success" ]; then
+            echo "{\"high\":0,\"medium\":0,\"low\":0,\"report_missing\":true,\"expose_status\":\"${EXPOSE_STATUS}\"}" \
+              > zap-out/zap-summary.json
+            cat zap-out/zap-summary.json
+            exit 0
+          fi
+
           if [ -f "report_json.json" ]; then
             HIGH=$(python3 -c "
-          import json
-          data = json.load(open('report_json.json'))
-          alerts = [a for s in data.get('site', []) for a in s.get('alerts', [])]
-          print(sum(1 for a in alerts if str(a.get('riskcode','')) == '3'))
-          " 2>/dev/null || echo "0")
+              import json
+              data = json.load(open('report_json.json'))
+              alerts = [a for s in data.get('site', []) for a in s.get('alerts', [])]
+              print(sum(1 for a in alerts if str(a.get('riskcode','')) == '3'))
+              " 2>/dev/null || echo "0")
+
             MEDIUM=$(python3 -c "
-          import json
-          data = json.load(open('report_json.json'))
-          alerts = [a for s in data.get('site', []) for a in s.get('alerts', [])]
-          print(sum(1 for a in alerts if str(a.get('riskcode','')) == '2'))
-          " 2>/dev/null || echo "0")
+              import json
+              data = json.load(open('report_json.json'))
+              alerts = [a for s in data.get('site', []) for a in s.get('alerts', [])]
+              print(sum(1 for a in alerts if str(a.get('riskcode','')) == '2'))
+              " 2>/dev/null || echo "0")
+
             LOW=$(python3 -c "
-          import json
-          data = json.load(open('report_json.json'))
-          alerts = [a for s in data.get('site', []) for a in s.get('alerts', [])]
-          print(sum(1 for a in alerts if str(a.get('riskcode','')) == '1'))
-          " 2>/dev/null || echo "0")
-            # report_missing=false → gate biết ZAP thật sự chạy
-            echo "{\"high\":${HIGH},\"medium\":${MEDIUM},\"low\":${LOW},\"report_missing\":false}" \
+              import json
+              data = json.load(open('report_json.json'))
+              alerts = [a for s in data.get('site', []) for a in s.get('alerts', [])]
+              print(sum(1 for a in alerts if str(a.get('riskcode','')) == '1'))
+              " 2>/dev/null || echo "0")
+
+            echo "{\"high\":${HIGH},\"medium\":${MEDIUM},\"low\":${LOW},\"report_missing\":false,\"expose_status\":\"success\"}" \
               > zap-out/zap-summary.json
           else
-            # report_missing=true → gate phân biệt "ZAP không chạy được" vs "không có finding"
-            echo '{"high":0,"medium":0,"low":0,"report_missing":true}' \
+            echo "{\"high\":0,\"medium\":0,\"low\":0,\"report_missing\":true,\"expose_status\":\"success\"}" \
               > zap-out/zap-summary.json
           fi
 
           cat zap-out/zap-summary.json
-
         continue-on-error: true
 
       - name: Upload artifact — zap-summary
@@ -932,9 +1017,32 @@ jobs:
               || { echo "❌ cluster not found"; exit 1; }
             kind export kubeconfig --name staging
 
-            docker pull --platform linux/amd64 "$IMAGE"
-            docker tag "$IMAGE" "$LOCAL_IMAGE"
-            kind load docker-image "$LOCAL_IMAGE" --name staging
+            echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+
+            kind get clusters | grep -q staging \
+              || { echo "❌ cluster not found"; exit 1; }
+            kind export kubeconfig --name staging
+
+            kubectl apply -f /home/ubuntu/k8s-production/namespace.yaml
+
+            kubectl create secret docker-registry ghcr-secret \
+              --docker-server=ghcr.io \
+              --docker-username="$ACTOR" \
+              --docker-password="$TOKEN" \
+              -n production \
+              --dry-run=client -o yaml | kubectl apply -f -
+
+            kubectl apply -f /home/ubuntu/k8s-production/postgres.yaml
+
+            sed "s|IMAGE_PLACEHOLDER|${IMAGE}|g" \
+              /home/ubuntu/k8s-production/app.yaml | kubectl apply -f -
+
+            kubectl rollout status deployment/postgres \
+              -n production --timeout=120s
+            kubectl rollout status deployment/restaurant-app \
+              -n production --timeout=180s
+
+            echo "✅ Production deployed with verified digest: $IMAGE"
 
             kubectl apply -f /home/ubuntu/k8s-production/namespace.yaml
             kubectl apply -f /home/ubuntu/k8s-production/postgres.yaml
