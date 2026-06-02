@@ -299,18 +299,25 @@ jobs:
               if not os.path.exists(path):
                   return None
               try:
-                  return json.load(open(path))
+                  with open(path, encoding="utf-8") as f:
+                      return json.load(f)
               except Exception as e:
                   print(f"[WARN] Cannot parse {path}: {e}")
                   return None
 
           def write(line=""):
-              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
                   f.write(line + "\n")
 
           def set_output(key, val):
-              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
                   f.write(f"{key}={val}\n")
+
+          def as_dict(value):
+              return value if isinstance(value, dict) else {}
+
+          def as_list(value):
+              return value if isinstance(value, list) else []
 
           art = "./artifacts"
           semgrep_path  = f"{art}/semgrep-report/semgrep.json"
@@ -320,75 +327,142 @@ jobs:
           pytest_path   = f"{art}/unit-test-report/pytest.xml"
 
           # ── Parse Semgrep ──────────────────────────────────
-          sg     = load_json(semgrep_path)
+          sg = load_json(semgrep_path)
           sg_missing = sg is None
           sg_total = sg_errors = sg_warnings = 0
-          sg_top   = []
-          if sg:
+          sg_top = []
+
+          if isinstance(sg, dict):
               results = sg.get("results", [])
+              results = results if isinstance(results, list) else []
+
               sg_total = len(results)
+
               for r in results:
-                  sev = r.get("extra", {}).get("severity", "").upper()
+                  if not isinstance(r, dict):
+                      continue
+
+                  extra = as_dict(r.get("extra", {}))
+                  sev = str(extra.get("severity", "")).upper()
+
                   if sev in ("ERROR", "HIGH"):
                       sg_errors += 1
                   elif sev in ("WARNING", "WARN", "MEDIUM"):
                       sg_warnings += 1
+
                   sg_top.append(r)
 
           # ── Parse Gitleaks ─────────────────────────────────
-          gl    = load_json(gitleaks_path)
+          gl = load_json(gitleaks_path)
           gl_missing = gl is None
           leaks = []
+
           if isinstance(gl, list):
-              leaks = gl
+              leaks = [x for x in gl if isinstance(x, dict)]
           elif isinstance(gl, dict):
-              leaks = gl.get("leaks", [])
+              raw_leaks = gl.get("leaks", [])
+              leaks = [x for x in as_list(raw_leaks) if isinstance(x, dict)]
+
           secret_count = len(leaks)
 
           # ── Parse pip-audit ────────────────────────────────
-          pip    = load_json(pip_path)
+          pip = load_json(pip_path)
           pip_missing = pip is None
           pip_skipped = isinstance(pip, dict) and pip.get("_skipped")
           pip_vuln_total = 0
-          pip_vuln_pkgs  = []
+          pip_vuln_pkgs = []
           pip_deps = []
+
           if pip and not pip_skipped:
-              pip_deps = pip if isinstance(pip, list) else pip.get("dependencies", [])
+              if isinstance(pip, list):
+                  pip_deps = pip
+              elif isinstance(pip, dict):
+                  deps = pip.get("dependencies", [])
+                  pip_deps = deps if isinstance(deps, list) else []
+              else:
+                  pip_deps = []
+
               for dep in pip_deps:
-                  v = dep.get("vulns", [])
-                  if v:
-                      pip_vuln_total += len(v)
-                      pip_vuln_pkgs.append(dep)
+                  if not isinstance(dep, dict):
+                      continue
+
+                  vulns = dep.get("vulns", [])
+                  vulns = vulns if isinstance(vulns, list) else []
+
+                  clean_vulns = [v for v in vulns if isinstance(v, dict)]
+
+                  if clean_vulns:
+                      pip_vuln_total += len(clean_vulns)
+                      pip_vuln_pkgs.append({
+                          "name": dep.get("name", "?"),
+                          "version": dep.get("version", "?"),
+                          "vulns": clean_vulns,
+                      })
 
           # ── Parse Checkov ──────────────────────────────────
-          ck    = load_json(checkov_path)
-          ck_missing  = ck is None
-          ck_skipped  = isinstance(ck, dict) and ck.get("_skipped")
+          ck = load_json(checkov_path)
+          ck_missing = ck is None
+          ck_skipped = isinstance(ck, dict) and ck.get("_skipped")
           ck_failed = ck_passed = 0
           ck_failed_checks = []
+
+          def collect_checkov(obj):
+              passed = []
+              failed = []
+
+              if isinstance(obj, dict):
+                  results = obj.get("results", {})
+
+                  if isinstance(results, dict):
+                      passed_items = results.get("passed_checks", [])
+                      failed_items = results.get("failed_checks", [])
+
+                      if isinstance(passed_items, list):
+                          passed.extend([x for x in passed_items if isinstance(x, dict)])
+
+                      if isinstance(failed_items, list):
+                          failed.extend([x for x in failed_items if isinstance(x, dict)])
+
+                  elif isinstance(results, list):
+                      for item in results:
+                          p, f = collect_checkov(item)
+                          passed.extend(p)
+                          failed.extend(f)
+
+              elif isinstance(obj, list):
+                  for item in obj:
+                      p, f = collect_checkov(item)
+                      passed.extend(p)
+                      failed.extend(f)
+
+              return passed, failed
+
           if ck and not ck_skipped:
-              r = ck.get("results", {})
-              ck_failed_checks = r.get("failed_checks", [])
+              passed_checks, failed_checks = collect_checkov(ck)
+              ck_passed = len(passed_checks)
+              ck_failed_checks = failed_checks
               ck_failed = len(ck_failed_checks)
-              ck_passed = len(r.get("passed_checks", []))
 
           # ── Parse pytest XML ───────────────────────────────
           pytest_missing = not os.path.exists(pytest_path)
-          pytest_failed  = False
+          pytest_failed = False
           pytest_tests = pytest_failures = pytest_errors = 0
+
           if not pytest_missing:
               try:
                   tree = ET.parse(pytest_path)
                   root = tree.getroot()
-                  # root có thể là <testsuites> hoặc <testsuite>
+
                   if root.tag == "testsuites":
                       suites = root.findall("testsuite")
                   else:
                       suites = [root]
+
                   for suite in suites:
-                      pytest_tests    += int(suite.get("tests",    0))
+                      pytest_tests += int(suite.get("tests", 0))
                       pytest_failures += int(suite.get("failures", 0))
-                      pytest_errors   += int(suite.get("errors",   0))
+                      pytest_errors += int(suite.get("errors", 0))
+
                   pytest_failed = (pytest_failures + pytest_errors) > 0
               except Exception as e:
                   print(f"[WARN] Cannot parse pytest XML: {e}")
@@ -396,11 +470,11 @@ jobs:
 
           # ── Job results từ env ─────────────────────────────
           job_results = {
-              "sast_scan"        : os.environ.get("SAST_RESULT",   "unknown"),
-              "secret_scan"      : os.environ.get("SECRET_RESULT", "unknown"),
-              "dependency_scan"  : os.environ.get("DEP_RESULT",    "unknown"),
-              "iac_config_scan"  : os.environ.get("IAC_RESULT",    "unknown"),
-              "unit_test"        : os.environ.get("TEST_RESULT",   "unknown"),
+              "sast_scan"       : os.environ.get("SAST_RESULT", "unknown"),
+              "secret_scan"     : os.environ.get("SECRET_RESULT", "unknown"),
+              "dependency_scan" : os.environ.get("DEP_RESULT", "unknown"),
+              "iac_config_scan" : os.environ.get("IAC_RESULT", "unknown"),
+              "unit_test"       : os.environ.get("TEST_RESULT", "unknown"),
           }
 
           # ── Gate Policy ────────────────────────────────────
@@ -441,33 +515,36 @@ jobs:
           write("# 🔒 Security & Test Gate")
           write()
 
-          # Bảng job status
           write("## Job Status")
           write()
           write("| Job | Runner | Gate |")
           write("|-----|--------|------|")
+
           job_labels = {
-              "sast_scan"      : "SAST (Semgrep)",
-              "secret_scan"    : "Secret Scan (Gitleaks)",
-              "dependency_scan": "Dependency Scan (pip-audit)",
-              "iac_config_scan": "IaC/Config Scan (Checkov)",
-              "unit_test"      : "Unit Test (pytest)",
+              "sast_scan"       : "SAST (Semgrep)",
+              "secret_scan"     : "Secret Scan (Gitleaks)",
+              "dependency_scan" : "Dependency Scan (pip-audit)",
+              "iac_config_scan" : "IaC/Config Scan (Checkov)",
+              "unit_test"       : "Unit Test (pytest)",
           }
+
           for key, label in job_labels.items():
-              r = job_results[key]
+              r = job_results.get(key, "unknown")
+
               if r == "success":
                   runner_icon = "✅"
               elif r == "skipped":
                   runner_icon = "⚠️"
               else:
                   runner_icon = "❌"
+
               write(f"| {label} | {runner_icon} {r} | — |")
 
           write()
           write("## Findings")
           write()
 
-          # Semgrep
+          # ── Semgrep Summary ─────────────────────────────────
           write("### 🔎 SAST — Semgrep")
           if sg_missing:
               write("> ⚠️ Report không tìm thấy")
@@ -475,48 +552,64 @@ jobs:
               write(f"- Tổng findings : **{sg_total}**")
               write(f"- ERROR/HIGH    : **{sg_errors}** ← block trigger")
               write(f"- WARNING/MEDIUM: **{sg_warnings}**")
+
               if sg_top:
                   write("")
                   write("<details><summary>Top findings (tối đa 5)</summary>")
                   write("")
                   write("| Severity | Rule | File:Line | Message |")
                   write("|----------|------|-----------|---------|")
+
                   for r in sg_top[:5]:
-                      sev  = r.get("extra", {}).get("severity", "?")
-                      rule = r.get("check_id", "?").split(".")[-1]
+                      if not isinstance(r, dict):
+                          continue
+
+                      extra = as_dict(r.get("extra", {}))
+                      start = as_dict(r.get("start", {}))
+
+                      sev = extra.get("severity", "?")
+                      rule = str(r.get("check_id", "?")).split(".")[-1]
                       path = r.get("path", "?")
-                      line = r.get("start", {}).get("line", "")
-                      msg  = r.get("extra", {}).get("message", "")[:80]
-                      loc  = f"{path}:{line}" if line else path
+                      line = start.get("line", "")
+                      msg = str(extra.get("message", ""))[:80]
+                      loc = f"{path}:{line}" if line else path
+
                       write(f"| `{sev}` | `{rule}` | `{loc}` | {msg} |")
+
                   write("")
                   write("</details>")
           write()
 
-          # Gitleaks
+          # ── Gitleaks Summary ───────────────────────────────
           write("### 🔑 Secret Scan — Gitleaks")
           if gl_missing:
               write("> ⚠️ Report không tìm thấy")
           else:
               write(f"- Secrets phát hiện : **{secret_count}**")
+
               if leaks:
                   write("")
                   write("<details><summary>Top secrets — chỉ hiện file/rule, KHÔNG hiện giá trị (tối đa 5)</summary>")
                   write("")
                   write("| Rule | File | Line | Commit |")
                   write("|------|------|------|--------|")
+
                   for leak in leaks[:5]:
-                      rule   = leak.get("RuleID",    leak.get("rule",   "?"))
-                      fpath  = leak.get("File",      leak.get("file",   "?"))
-                      lineno = leak.get("StartLine", leak.get("line",   "?"))
-                      commit = str(leak.get("Commit", leak.get("commit","?")))[:8]
-                      # Tuyệt đối không print Secret/Match value
+                      if not isinstance(leak, dict):
+                          continue
+
+                      rule = leak.get("RuleID", leak.get("rule", "?"))
+                      fpath = leak.get("File", leak.get("file", "?"))
+                      lineno = leak.get("StartLine", leak.get("line", "?"))
+                      commit = str(leak.get("Commit", leak.get("commit", "?")))[:8]
+
                       write(f"| `{rule}` | `{fpath}` | {lineno} | `{commit}` |")
+
                   write("")
                   write("</details>")
           write()
 
-          # pip-audit
+          # ── pip-audit Summary ──────────────────────────────
           write("### 📦 Dependency Scan — pip-audit")
           if pip_missing:
               write("> ⚠️ Report không tìm thấy")
@@ -524,21 +617,34 @@ jobs:
               write("> ℹ️ Skipped — không có requirements file")
           else:
               write(f"- Vulnerabilities : **{pip_vuln_total}**")
+
               if pip_vuln_pkgs:
                   write("")
                   write("<details><summary>Packages có CVE (tối đa 5)</summary>")
                   write("")
+
                   for dep in pip_vuln_pkgs[:5]:
-                      write(f"**`{dep.get('name')}=={dep.get('version')}`**")
-                      for v in dep.get("vulns", [])[:3]:
-                          vid  = v.get("id", "?")
+                      name = dep.get("name", "?")
+                      version = dep.get("version", "?")
+                      vulns = dep.get("vulns", [])
+                      vulns = vulns if isinstance(vulns, list) else []
+
+                      write(f"**`{name}=={version}`**")
+
+                      for v in vulns[:3]:
+                          if not isinstance(v, dict):
+                              continue
+
+                          vid = v.get("id", "?")
                           desc = str(v.get("description", v.get("fix_versions", "")))[:100]
                           write(f"- `{vid}`: {desc}")
+
                       write("")
+
                   write("</details>")
           write()
 
-          # Checkov
+          # ── Checkov Summary ────────────────────────────────
           write("### 🏗️ IaC/Config Scan — Checkov")
           if ck_missing:
               write("> ⚠️ Report không tìm thấy")
@@ -547,24 +653,35 @@ jobs:
           else:
               write(f"- Passed checks : **{ck_passed}**")
               write(f"- Failed checks : **{ck_failed}** (threshold: {CHECKOV_BLOCK_THRESHOLD})")
+
               if ck_failed_checks:
                   write("")
                   write("<details><summary>Top failed checks (tối đa 5)</summary>")
                   write("")
                   write("| Check ID | Check Name | File | Lines |")
                   write("|----------|------------|------|-------|")
+
                   for c in ck_failed_checks[:5]:
-                      cid   = c.get("check_id",   "?")
-                      cname = c.get("check_name", "?")[:60]
-                      fpath = c.get("file_path",  "?")
+                      if not isinstance(c, dict):
+                          continue
+
+                      cid = c.get("check_id", "?")
+                      cname = str(c.get("check_name", "?"))[:60]
+                      fpath = c.get("file_path", "?")
                       lines = c.get("file_line_range", ["?", "?"])
-                      ls    = f"{lines[0]}-{lines[1]}" if isinstance(lines, list) else str(lines)
+
+                      if isinstance(lines, list) and len(lines) >= 2:
+                          ls = f"{lines[0]}-{lines[1]}"
+                      else:
+                          ls = str(lines)
+
                       write(f"| `{cid}` | {cname} | `{fpath}` | {ls} |")
+
                   write("")
                   write("</details>")
           write()
 
-          # pytest
+          # ── pytest Summary ─────────────────────────────────
           write("### 🧪 Unit Test — pytest")
           if pytest_missing:
               write("> ⚠️ Report không tìm thấy")
@@ -576,9 +693,10 @@ jobs:
               write(f"- Errors   : **{pytest_errors}**")
           write()
 
-          # Kết luận
+          # ── Kết luận ───────────────────────────────────────
           write("---")
           write()
+
           if should_block:
               write("## ❌ Block — Không build image")
               write()
@@ -603,6 +721,7 @@ jobs:
               sys.exit(1)
           else:
               print("\n✅ GATE PASSED — proceeding to build")
+              sys.exit(0)
 
           PYTHON_SCRIPT
 
@@ -612,6 +731,8 @@ jobs:
           DEP_RESULT:    ${{ needs.dependency_scan.result }}
           IAC_RESULT:    ${{ needs.iac_config_scan.result }}
           TEST_RESULT:   ${{ needs.unit_test.result }}
+
+
 
 
 # ============================================================
@@ -802,18 +923,35 @@ jobs:
               if not os.path.exists(path):
                   return None
               try:
-                  return json.load(open(path))
+                  with open(path, encoding="utf-8") as f:
+                      return json.load(f)
               except Exception as e:
                   print(f"[WARN] Cannot parse {path}: {e}")
                   return None
 
+          def read_text(path):
+              if not os.path.exists(path):
+                  return None
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      return f.read().strip()
+              except Exception as e:
+                  print(f"[WARN] Cannot read {path}: {e}")
+                  return None
+
           def write(line=""):
-              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as f:
                   f.write(line + "\n")
 
           def set_output(key, val):
-              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
                   f.write(f"{key}={val}\n")
+
+          def as_dict(value):
+              return value if isinstance(value, dict) else {}
+
+          def as_list(value):
+              return value if isinstance(value, list) else []
 
           art = "./artifacts"
 
@@ -822,30 +960,69 @@ jobs:
           sbom_path   = f"{art}/sbom-report/sbom.cdx.json"
           digest_path = f"{art}/image-digest/image-digest.txt"
 
-          trivy    = load_json(trivy_path)
-          sbom     = load_json(sbom_path)
-          digest   = None
-          if os.path.exists(digest_path):
-              digest = open(digest_path).read().strip()
+          trivy  = load_json(trivy_path)
+          sbom   = load_json(sbom_path)
+          digest = read_text(digest_path)
 
-          # ── Parse Trivy ────────────────────────────────────
-          trivy_missing  = trivy is None
-          trivy_error    = isinstance(trivy, dict) and trivy.get("_error")
-          critical_count = high_count = medium_count = 0
+          # fallback từ build output nếu artifact digest bị thiếu
+          if not digest:
+              digest = os.environ.get("BUILD_DIGEST", "").strip()
+
+          # ── Parse Trivy defensive ───────────────────────────
+          trivy_missing = trivy is None
+          trivy_error = isinstance(trivy, dict) and bool(trivy.get("_error"))
+
+          critical_count = 0
+          high_count = 0
+          medium_count = 0
           trivy_top_vulns = []
 
+          def get_trivy_results(obj):
+              """
+              Trivy thường trả dict có key Results.
+              Nhưng để tránh gate crash, hỗ trợ cả list hoặc format lệch.
+              """
+              if isinstance(obj, dict):
+                  results = obj.get("Results", [])
+                  return results if isinstance(results, list) else []
+              if isinstance(obj, list):
+                  return obj
+              return []
+
           if trivy and not trivy_error:
-              for result in trivy.get("Results", []):
-                  for vuln in result.get("Vulnerabilities", []):
-                      sev = vuln.get("Severity", "").upper()
+              for result in get_trivy_results(trivy):
+                  if not isinstance(result, dict):
+                      continue
+
+                  vulns = result.get("Vulnerabilities", [])
+                  vulns = vulns if isinstance(vulns, list) else []
+
+                  for vuln in vulns:
+                      if not isinstance(vuln, dict):
+                          continue
+
+                      sev = str(vuln.get("Severity", "")).upper()
+
                       if sev == "CRITICAL":
                           critical_count += 1
                       elif sev == "HIGH":
                           high_count += 1
                       elif sev == "MEDIUM":
                           medium_count += 1
+
                       if sev in ("CRITICAL", "HIGH"):
                           trivy_top_vulns.append(vuln)
+
+          # ── Parse SBOM defensive ────────────────────────────
+          sbom_missing = sbom is None
+          sbom_error = isinstance(sbom, dict) and bool(sbom.get("_error"))
+          sbom_ok = sbom is not None and not sbom_error
+
+          comp_count = 0
+          if sbom_ok and isinstance(sbom, dict):
+              components = sbom.get("components", [])
+              components = components if isinstance(components, list) else []
+              comp_count = len(components)
 
           # ── Gate Policy ────────────────────────────────────
           block_reasons = []
@@ -865,21 +1042,20 @@ jobs:
                       f"Trivy: {high_count} HIGH vượt threshold ({HIGH_THRESHOLD})"
                   )
 
-          sbom_ok = sbom is not None and not (
-              isinstance(sbom, dict) and sbom.get("_error")
-          )
           if not sbom_ok:
-              block_reasons.append("SBOM không được tạo")
+              block_reasons.append("SBOM không được tạo hoặc bị lỗi")
 
           should_block = bool(block_reasons)
 
           # ── Write Summary ──────────────────────────────────
           write("# 🏺 Artifact Gate")
           write()
+
           write("## Job Status")
           write()
           write("| Job | Runner Result |")
           write("|-----|--------------|")
+
           scan_result = os.environ.get("ARTIFACT_SCAN_RESULT", "unknown")
           if scan_result == "success":
               scan_icon = "✅"
@@ -887,35 +1063,47 @@ jobs:
               scan_icon = "⚠️"
           else:
               scan_icon = "❌"
+
           write(f"| Artifact Scan (Trivy + SBOM) | {scan_icon} {scan_result} |")
           write()
+
           write("## Image Info")
           write()
-          write(f"- **Image** : `${{ env.IMAGE_NAME }}:${{ github.sha }}`")
+          write(f"- **Image** : `{os.environ.get('IMAGE_NAME', 'unknown')}:{os.environ.get('GITHUB_SHA', 'unknown')}`")
           write(f"- **Digest**: `{digest or 'N/A'}`")
           write()
 
           write("## Trivy Vulnerability Scan")
           write()
-          if trivy_missing or trivy_error:
-              write("> ⚠️ Trivy report không tìm thấy hoặc bị lỗi")
+
+          if trivy_missing:
+              write("> ⚠️ Trivy report không tìm thấy")
+          elif trivy_error:
+              write("> ⚠️ Trivy report có marker `_error`")
           else:
               write(f"- CRITICAL : **{critical_count}** (threshold: {CRITICAL_THRESHOLD})")
               write(f"- HIGH     : **{high_count}** (threshold: {HIGH_THRESHOLD})")
               write(f"- MEDIUM   : **{medium_count}** (informational)")
+
               if trivy_top_vulns:
                   write("")
                   write("<details><summary>Top CRITICAL/HIGH vulnerabilities (tối đa 5)</summary>")
                   write("")
                   write("| Severity | CVE | Package | Installed | Fixed |")
                   write("|----------|-----|---------|-----------|-------|")
+
                   for v in trivy_top_vulns[:5]:
-                      sev     = v.get("Severity",         "?")
-                      cve     = v.get("VulnerabilityID",  "?")
-                      pkg     = v.get("PkgName",          "?")
-                      inst    = v.get("InstalledVersion", "?")
-                      fixed   = v.get("FixedVersion",     "N/A")
+                      if not isinstance(v, dict):
+                          continue
+
+                      sev = v.get("Severity", "?")
+                      cve = v.get("VulnerabilityID", "?")
+                      pkg = v.get("PkgName", "?")
+                      inst = v.get("InstalledVersion", "?")
+                      fixed = v.get("FixedVersion", "N/A")
+
                       write(f"| `{sev}` | `{cve}` | `{pkg}` | {inst} | {fixed} |")
+
                   write("")
                   write("</details>")
           write()
@@ -923,13 +1111,15 @@ jobs:
           write("## SBOM")
           write()
           write(f"- SBOM generated: **{'✅ Yes' if sbom_ok else '❌ No'}**")
-          if sbom_ok and isinstance(sbom, dict):
-              comp_count = len(sbom.get("components", []))
+
+          if sbom_ok:
               write(f"- Components    : **{comp_count}**")
+
           write()
 
           write("---")
           write()
+
           if should_block:
               write("## ❌ Block — Không sign/promote image")
               write()
@@ -952,11 +1142,14 @@ jobs:
               sys.exit(1)
           else:
               print("\n✅ ARTIFACT GATE PASSED — proceeding to sign")
+              sys.exit(0)
 
           PYTHON_SCRIPT
 
         env:
-          IMAGE_NAME:           ${{ env.IMAGE_NAME }}
+          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          GITHUB_SHA: ${{ github.sha }}
+          BUILD_DIGEST: ${{ needs.build_image.outputs.digest }}
           ARTIFACT_SCAN_RESULT: ${{ needs.artifact_scan.result }}
 
 
