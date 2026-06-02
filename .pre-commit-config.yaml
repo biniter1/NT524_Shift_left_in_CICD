@@ -3,29 +3,44 @@ repos:
     rev: v8.18.4
     hooks:
       - id: gitleaks
-        name: "🔐 Secret scan (Gitleaks)"
+        name: "Secret scan with Gitleaks"
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:
-      # Format
+      # Code hygiene
       - id: trailing-whitespace
-        name: "✂️  Trailing whitespace"
+        name: "Remove trailing whitespace"
+
       - id: end-of-file-fixer
-        name: "📄 End of file fixer"
+        name: "Fix end of file"
 
+      # Config syntax check
       - id: check-yaml
-        name: "📋 YAML syntax check"
-        exclude: ^k8s/
-      - id: check-json
-        name: "📋 JSON syntax check"
-      - id: check-toml
-        name: "📋 TOML syntax check"
+        name: "YAML syntax check"
+        args: ["--allow-multiple-documents"]
+        exclude: ^(helm/|charts/)
 
+      - id: check-json
+        name: "JSON syntax check"
+
+      - id: check-toml
+        name: "TOML syntax check"
+
+      # Repository safety
       - id: check-added-large-files
-        name: "📦 Large file check"
+        name: "Large file check"
         args: ["--maxkb=500"]
+
       - id: detect-private-key
-        name: "🔑 Private key detect"
+        name: "Private key detection"
+
       - id: check-merge-conflict
-        name: "⚠️  Merge conflict check"
+        name: "Merge conflict marker check"
+
+      - id: check-case-conflict
+        name: "Case conflict check"
+
+      - id: mixed-line-ending
+        name: "Normalize mixed line ending"
+        args: ["--fix=lf"]

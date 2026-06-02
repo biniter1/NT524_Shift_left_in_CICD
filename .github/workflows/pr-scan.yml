@@ -1,3 +1,9 @@
+# ============================================================
+# PR Scan Workflow
+# Mindset: Scanner tạo evidence → Gate quyết định pass/fail
+# Trigger: Pull Request vào nhánh develop
+# ============================================================
+
 name: PR Scan
 
 on:
@@ -7,121 +13,135 @@ on:
     types: [opened, synchronize, reopened]
 
 jobs:
-  sast:
-    name: "SAST (Semgrep diff-only)"
+
+  # ============================================================
+  # JOB 1: SAST — Semgrep
+  # Mục tiêu: scan code, xuất report, KHÔNG fail workflow
+  # ============================================================
+  sast_scan:
+    name: "SAST (Semgrep)"
     runs-on: ubuntu-latest
-    permissions:
-      security-events: write
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # Fix 1: fetch develop để baseline-commit hoạt động
-      - name: Fetch develop branch
+      - name: Fetch develop branch (baseline)
         run: git fetch origin develop
 
-      # Fix 12: dùng official semgrep action
-      - name: Run Semgrep diff-only
-        uses: semgrep/semgrep-action@v1
+      - name: Setup Python & install Semgrep
+        uses: actions/setup-python@v5
         with:
-          config: >-
-            p/python
-            p/owasp-top-ten
-            p/secrets
-          generateSarif: "1"
-          publishToken: ${{ secrets.SEMGREP_APP_TOKEN }}
-        env:
-          SEMGREP_BASELINE_REF: origin/develop
-        continue-on-error: true
+          python-version: "3.11"
 
-      - name: Upload Semgrep SARIF
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: semgrep.sarif
-          category: semgrep-pr
-
-      - name: Save SAST results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: sast-pr-${{ github.sha }}
-          path: semgrep.sarif
-
-  config-scan:
-    name: "Config Scan (Checkov diff-only)"
-    runs-on: ubuntu-latest
-    permissions:
-      security-events: write
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      # Fix 1: fetch develop
-      - name: Fetch develop branch
-        run: git fetch origin develop
-
-      - name: Get changed config files
-        id: config-check
+      - name: Run Semgrep — xuất JSON report
+        # Semgrep exit 1 khi có finding → dùng || true để job không fail
+        # Dùng git merge-base để lấy common ancestor chính xác của PR với develop
         run: |
-          git diff --name-only origin/develop...HEAD \
-            | grep -E '\.(tf|yaml|yml|json)$' \
-            | grep -E '^(terraform/|k8s/|ansible/)' \
-            > changed_configs.txt || true
+          pip install semgrep --quiet
+          mkdir -p reports
 
-          echo "Changed config files:"
-          cat changed_configs.txt || echo "None"
+          # merge-base cho đúng nghĩa "chỉ scan những gì PR thêm vào"
+          BASELINE_COMMIT=$(git merge-base origin/develop HEAD)
+          echo "Baseline commit: $BASELINE_COMMIT"
 
-          # Fix 2: dùng -s check file rỗng hay không
-          if [ -s changed_configs.txt ]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-            echo "No config files changed — skip"
+          semgrep \
+            --config p/python \
+            --config p/owasp-top-ten \
+            --config p/secrets \
+            --baseline-commit "$BASELINE_COMMIT" \
+            --json \
+            --output reports/semgrep.json \
+            . \
+            || true
+
+          # Nếu semgrep không tạo file (ví dụ không có diff), tạo report rỗng
+          if [ ! -f reports/semgrep.json ]; then
+            echo '{"results":[],"errors":[],"paths":{}}' > reports/semgrep.json
+            echo "semgrep_skipped=true" >> $GITHUB_ENV
           fi
 
-      # Fix 3: loop từng file thay vì truyền file list
-      - name: Run Checkov on changed files
-        if: steps.config-check.outputs.changed == 'true'
-        run: |
-          pip install checkov
-          # Reset output file
-          echo '{"runs":[]}' > checkov-pr.sarif
+          echo "Semgrep report:"
+          cat reports/semgrep.json | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          print(f'  Total findings : {len(d.get(\"results\", []))}')
+          print(f'  Errors         : {len(d.get(\"errors\", []))}')
+          " || true
 
-          while IFS= read -r file; do
-            if [ -f "$file" ]; then
-              echo "Scanning: $file"
-              checkov \
-                -f "$file" \
-                --output sarif \
-                --output-file-path /tmp/checkov-tmp.sarif \
-                --soft-fail \
-                || true
-
-              # Merge kết quả nếu có
-              if [ -f "/tmp/checkov-tmp.sarif" ]; then
-                cp /tmp/checkov-tmp.sarif checkov-pr.sarif
-              fi
-            fi
-          done < changed_configs.txt
-
-      - name: Upload Checkov SARIF
-        if: steps.config-check.outputs.changed == 'true'
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: checkov-pr.sarif
-          category: checkov-pr
-
-      - name: Save config results
-        if: steps.config-check.outputs.changed == 'true'
+      - name: Upload artifact — semgrep-report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: config-pr-${{ github.sha }}
-          path: checkov-pr.sarif
+          name: semgrep-report
+          path: reports/semgrep.json
+          retention-days: 30
 
-  dependency-scan:
+
+  # ============================================================
+  # JOB 2: Secret Scan — Gitleaks
+  # Mục tiêu: phát hiện secret bị commit, xuất report JSON
+  # ============================================================
+  secret_scan:
+    name: "Secret Scan (Gitleaks)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch develop branch
+        run: git fetch origin develop
+
+      - name: Run Gitleaks — scan diff PR (Docker)
+        run: |
+          mkdir -p reports
+
+          # Dùng Docker để tránh vấn đề tên binary thay đổi theo version/OS
+          # --log-opts scan đúng commit range của PR so với develop
+          # exit code 1 = found secrets → || true để job không fail
+          docker run --rm \
+          -v "$PWD:/repo" \
+          ghcr.io/gitleaks/gitleaks:latest detect \
+            --source=/repo \
+            --log-opts="origin/develop...HEAD" \
+            --report-format=json \
+            --report-path=/repo/reports/gitleaks.json \
+          || true
+
+          # Gitleaks không tạo file nếu không có finding → tạo list rỗng
+          if [ ! -f reports/gitleaks.json ]; then
+            echo '[]' > reports/gitleaks.json
+          fi
+
+          SECRET_COUNT=$(python3 -c "
+          import json
+          data = json.load(open('reports/gitleaks.json'))
+          if isinstance(data, list):
+              print(len(data))
+          elif isinstance(data, dict):
+              print(len(data.get('leaks', [])))
+          else:
+              print(0)
+          " || echo 0)
+
+          echo "Secrets found: $SECRET_COUNT"
+
+      - name: Upload artifact — secret-scan-report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: secret-scan-report
+          path: reports/gitleaks.json
+          retention-days: 30
+
+
+  # ============================================================
+  # JOB 3: Dependency Scan — pip-audit
+  # Gộp dependency-scan và library-scan thành 1 job duy nhất
+  # Mục tiêu: kiểm tra CVE trong dependencies, xuất JSON
+  # ============================================================
+  dependency_scan:
     name: "Dependency Scan (pip-audit)"
     runs-on: ubuntu-latest
     steps:
@@ -129,188 +149,490 @@ jobs:
         with:
           fetch-depth: 0
 
-      # Fix 1: fetch develop
-      - name: Fetch develop branch
-        run: git fetch origin develop
-
-      - name: Check if dependency files changed
-        id: dep-changed
-        run: |
-          CHANGED=$(git diff --name-only origin/develop...HEAD \
-            | grep -E 'pyproject\.toml|poetry\.lock' || true)
-          if [ -n "$CHANGED" ]; then
-            echo "changed=true" >> $GITHUB_OUTPUT
-            echo "Changed: $CHANGED"
-          else
-            echo "changed=false" >> $GITHUB_OUTPUT
-            echo "No dependency files changed — skip"
-          fi
-
-      # Fix 11: cache pip
       - name: Setup Python
-        if: steps.dep-changed.outputs.changed == 'true'
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
+          cache: "pip"
 
-      # Fix 4: --only main thay vì --without dev
-      - name: Export requirements
-        if: steps.dep-changed.outputs.changed == 'true'
+      - name: Install tools
+        run: pip install poetry==1.8.3 pip-audit --quiet
+
+      - name: Export requirements từ Poetry
         run: |
-          pip install poetry==1.8.3
-          poetry export \
-            -f requirements.txt \
-            --output requirements-pr.txt \
-            --without-hashes \
-            --only main
+          mkdir -p reports
+
+          # Thử export từ poetry trước
+          if [ -f pyproject.toml ]; then
+            poetry export \
+              -f requirements.txt \
+              --output reports/requirements.txt \
+              --without-hashes \
+              --only main \
+              || true
+          fi
+
+          # Fallback: dùng requirements.txt gốc nếu có
+          if [ ! -s reports/requirements.txt ] && [ -f requirements.txt ]; then
+            cp requirements.txt reports/requirements.txt
+          fi
+
+          # Nếu vẫn không có file requirements → skipped hợp lệ
+          if [ ! -s reports/requirements.txt ]; then
+            echo "No requirements file found — creating empty report"
+            echo '{"dependencies":[],"_skipped":true}' > reports/pip-audit.json
+          fi
 
       - name: Run pip-audit
-        if: steps.dep-changed.outputs.changed == 'true'
         run: |
-          pip install pip-audit
-          pip-audit \
-            -r requirements-pr.txt \
-            --format=json \
-            --output=pip-audit-pr.json \
-            || true
+          if [ -f reports/pip-audit.json ]; then
+            # Đã tạo empty report ở bước trước (skipped)
+            echo "Skipping pip-audit — no requirements"
+          else
+            pip-audit \
+              -r reports/requirements.txt \
+              --format json \
+              --output reports/pip-audit.json \
+              || true
 
-      - name: Save results
-        if: steps.dep-changed.outputs.changed == 'true'
+            # Nếu pip-audit không tạo file vì lý do khác
+            if [ ! -f reports/pip-audit.json ]; then
+              echo '{"dependencies":[]}' > reports/pip-audit.json
+            fi
+          fi
+
+          python3 -c "
+          import json
+          data = json.load(open('reports/pip-audit.json'))
+          deps = data if isinstance(data, list) else data.get('dependencies', [])
+          total = sum(len(d.get('vulns', [])) for d in deps)
+          print(f'Vulnerabilities found: {total}')
+          " || true
+
+      - name: Upload artifact — dependency-report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: dep-pr-${{ github.sha }}
-          path: pip-audit-pr.json
+          name: dependency-report
+          path: reports/pip-audit.json
+          retention-days: 30
 
-  library-scan:
-    name: "Library Scan (pip-audit)"
+
+  # ============================================================
+  # JOB 4: IaC/Config Scan — Checkov
+  # Scan toàn bộ repo (ổn định hơn diff-only với Checkov)
+  # Xuất JSON để gate parse dễ hơn SARIF
+  # ============================================================
+  iac_config_scan:
+    name: "IaC/Config Scan (Checkov)"
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      # Fix 11: cache pip
-      - name: Setup Python
+      - name: Setup Python & install Checkov
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
 
-      # Fix 4: --only main
-      - name: Export + scan libraries
+      - name: Install Checkov
+        run: pip install checkov --quiet
+
+      - name: Detect config/IaC files
+        id: detect
         run: |
-          pip install poetry==1.8.3 pip-audit
-          poetry export \
-            -f requirements.txt \
-            --output requirements-lib.txt \
-            --without-hashes \
-            --only main
+          # Tìm các file IaC/config trong repo
+          FILES=$(find . \
+            -not -path './.git/*' \
+            -not -path './node_modules/*' \
+            \( \
+              -name "*.tf" \
+              -o -name "*.tfvars" \
+              -o \( -name "*.yml" -o -name "*.yaml" \) \
+              -o -name "Dockerfile" \
+            \) \
+            2>/dev/null | head -100 || true)
 
-          pip-audit \
-            -r requirements-lib.txt \
-            --format=json \
-            --output=library-scan-pr.json \
-            || true
+          if [ -n "$FILES" ]; then
+            echo "has_files=true" >> $GITHUB_OUTPUT
+            echo "Found $(echo "$FILES" | wc -l) config file(s)"
+          else
+            echo "has_files=false" >> $GITHUB_OUTPUT
+            echo "No IaC/config files found"
+          fi
 
-      - name: Save results
+      - name: Run Checkov — scan toàn bộ repo
+        run: |
+          mkdir -p reports
+
+          if [ "${{ steps.detect.outputs.has_files }}" == "true" ]; then
+            # Scan toàn bộ thư mục, xuất JSON một lần duy nhất
+            # --soft-fail để checkov không exit 1 → dùng || true cho chắc
+            checkov \
+              --directory . \
+              --output json \
+              --output-file-path reports/ \
+              --soft-fail \
+              --quiet \
+              || true
+
+            # Checkov tạo file results_json.json trong output-file-path
+            if [ -f reports/results_json.json ]; then
+              mv reports/results_json.json reports/checkov.json
+            else
+              echo '{"results":{"passed_checks":[],"failed_checks":[]},"_note":"no output generated"}' \
+                > reports/checkov.json
+            fi
+          else
+            # Không có file để scan → tạo marker rỗng
+            echo '{"results":{"passed_checks":[],"failed_checks":[]},"_skipped":true}' \
+              > reports/checkov.json
+          fi
+
+          python3 -c "
+          import json
+          data = json.load(open('reports/checkov.json'))
+          results = data.get('results', {})
+          passed = len(results.get('passed_checks', []))
+          failed = len(results.get('failed_checks', []))
+          print(f'Checkov — passed: {passed}, failed: {failed}')
+          " || true
+
+      - name: Upload artifact — checkov-report
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: lib-pr-${{ github.sha }}
-          path: library-scan-pr.json
+          name: checkov-report
+          path: reports/checkov.json
+          retention-days: 30
 
+
+  # ============================================================
+  # JOB 5: Gate — Tổng hợp findings, quyết định Block/Allow
+  # Đây là nơi DUY NHẤT được phép exit 1
+  # ============================================================
   gate:
-    name: "Gate PR Scan"
+    name: "Gate — Block or Allow Merge"
     runs-on: ubuntu-latest
-    needs: [sast, config-scan, dependency-scan, library-scan]
-    if: always()
+    needs: [sast_scan, secret_scan, dependency_scan, iac_config_scan]
+    if: always()   # Luôn chạy dù scan job có fail
     steps:
-      - name: Download all results
+      - name: Download tất cả scan artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: "*-pr-${{ github.sha }}"
-          merge-multiple: true
-          path: ./results
+          # Download tất cả artifact của workflow này
+          path: ./artifacts
         continue-on-error: true
 
-      - name: Evaluate gate
+      - name: Parse reports & quyết định Gate
         run: |
-          echo "## 🔍 PR Scan Gate" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Job | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----|--------|" >> $GITHUB_STEP_SUMMARY
+          python3 << 'PYTHON_SCRIPT'
+          import json
+          import os
+          import sys
 
-          BLOCK=0
-
-          # Check job results
-          for name_result in \
-            "SAST:${{ needs.sast.result }}" \
-            "Config Scan:${{ needs.config-scan.result }}" \
-            "Dependency Scan:${{ needs.dependency-scan.result }}" \
-            "Library Scan:${{ needs.library-scan.result }}"; do
-            name="${name_result%%:*}"
-            result="${name_result##*:}"
-            if [[ "$result" == "failure" ]]; then
-              echo "| $name | ❌ FAILED |" >> $GITHUB_STEP_SUMMARY
-              ((BLOCK++))
-            else
-              echo "| $name | ✅ PASSED |" >> $GITHUB_STEP_SUMMARY
-            fi
-          done
-
-          # Fix 5: parse pip-audit JSON đúng format (list, không phải dict)
-          CRITICAL_DEP=0
-          for f in \
-            ./results/pip-audit-pr.json \
-            ./results/library-scan-pr.json; do
-            if [ -f "$f" ]; then
-              COUNT=$(python3 -c "
-                import json, sys
-                try:
-                    data = json.load(open('$f'))
-                    # pip-audit output là list
-                    if isinstance(data, list):
-                        vulns = sum(len(dep.get('vulns', [])) for dep in data)
-                    # hoặc dict với key dependencies
-                    elif isinstance(data, dict):
-                        vulns = sum(len(dep.get('vulns', []))
-                                    for dep in data.get('dependencies', []))
-                    else:
-                        vulns = 0
-                    print(vulns)
-                except Exception as e:
-                    print(0)
-                ")
-              CRITICAL_DEP=$((CRITICAL_DEP + COUNT))
-            fi
-          done
-
-          # Parse SAST critical từ SARIF
-          CRITICAL_SAST=0
-          if [ -f "./results/semgrep.sarif" ]; then
-            CRITICAL_SAST=$(python3 -c "
-              import json
+          # ── Helper ──────────────────────────────────────────
+          def load_json(path):
+              """Load JSON, trả về None nếu file không tồn tại hoặc parse lỗi."""
+              if not os.path.exists(path):
+                  return None
               try:
-                  data = json.load(open('./results/semgrep.sarif'))
-                  errors = sum(1 for run in data.get('runs', [])
-                              for r in run.get('results', [])
-                              if r.get('level') == 'error')
-                  print(errors)
-              except:
-                  print(0)
-              ")
-          fi
+                  with open(path) as f:
+                      return json.load(f)
+              except Exception as e:
+                  print(f"[WARN] Cannot parse {path}: {e}")
+                  return None
 
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Findings" >> $GITHUB_STEP_SUMMARY
-          echo "- SAST Critical: **${CRITICAL_SAST}**" >> $GITHUB_STEP_SUMMARY
-          echo "- Dependency CVEs: **${CRITICAL_DEP}**" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          def write(line=""):
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as f:
+                  f.write(line + "\n")
 
-          # Fix 7: gate thật sự block dựa trên findings
-          if [[ "${BLOCK}" -gt 0 ]] || \
-             [[ "${CRITICAL_SAST}" -gt 0 ]] || \
-             [[ "${CRITICAL_DEP}" -gt 0 ]]; then
-            echo "### ❌ Block Merge" >> $GITHUB_STEP_SUMMARY
-            exit 1
-          else
-            echo "### ✅ Allow Merge" >> $GITHUB_STEP_SUMMARY
-          fi
+          artifacts_dir = "./artifacts"
+
+          # ── Đường dẫn các report ────────────────────────────
+          # actions/download-artifact@v4 tạo subfolder theo tên artifact
+          semgrep_path   = f"{artifacts_dir}/semgrep-report/semgrep.json"
+          gitleaks_path  = f"{artifacts_dir}/secret-scan-report/gitleaks.json"
+          pip_audit_path = f"{artifacts_dir}/dependency-report/pip-audit.json"
+          checkov_path   = f"{artifacts_dir}/checkov-report/checkov.json"
+
+          # ── Parse Semgrep ────────────────────────────────────
+          semgrep_data     = load_json(semgrep_path)
+          semgrep_missing  = semgrep_data is None
+          semgrep_total    = 0
+          semgrep_errors   = 0   # severity ERROR = block trigger
+          semgrep_warnings = 0
+
+          if semgrep_data:
+              results = semgrep_data.get("results", [])
+              semgrep_total = len(results)
+              for r in results:
+                  sev = r.get("extra", {}).get("severity", "").upper()
+                  if sev == "ERROR":
+                      semgrep_errors += 1
+                  elif sev in ("WARNING", "WARN"):
+                      semgrep_warnings += 1
+
+          # ── Parse Gitleaks ───────────────────────────────────
+          gitleaks_data    = load_json(gitleaks_path)
+          gitleaks_missing = gitleaks_data is None
+          secret_count     = 0
+
+          if gitleaks_data:
+              if isinstance(gitleaks_data, list):
+                  secret_count = len(gitleaks_data)
+              # Một số version trả dict với key "leaks"
+              elif isinstance(gitleaks_data, dict):
+                  secret_count = len(gitleaks_data.get("leaks", []))
+
+          # ── Parse pip-audit ──────────────────────────────────
+          pip_data         = load_json(pip_audit_path)
+          pip_missing      = pip_data is None
+          pip_skipped      = isinstance(pip_data, dict) and pip_data.get("_skipped")
+          pip_vuln_total   = 0
+          pip_vuln_pkgs    = []
+
+          if pip_data and not pip_skipped:
+              # pip-audit JSON: list of {name, version, vulns:[...]}
+              deps = pip_data if isinstance(pip_data, list) \
+                    else pip_data.get("dependencies", [])
+              for dep in deps:
+                  vulns = dep.get("vulns", [])
+                  if vulns:
+                      pip_vuln_total += len(vulns)
+                      pip_vuln_pkgs.append(
+                          f"{dep.get('name','?')}=={dep.get('version','?')} "
+                          f"({len(vulns)} CVE)"
+                      )
+
+          # ── Parse Checkov ────────────────────────────────────
+          checkov_data     = load_json(checkov_path)
+          checkov_missing  = checkov_data is None
+          checkov_skipped  = isinstance(checkov_data, dict) and checkov_data.get("_skipped")
+          checkov_failed   = 0
+          checkov_passed   = 0
+
+          if checkov_data and not checkov_skipped:
+              results = checkov_data.get("results", {})
+              checkov_failed = len(results.get("failed_checks", []))
+              checkov_passed = len(results.get("passed_checks", []))
+
+          # ── Job results từ env (inject bên dưới) ─────────────
+          job_results = {
+              "sast_scan"        : os.environ.get("SAST_RESULT", "unknown"),
+              "secret_scan"      : os.environ.get("SECRET_RESULT", "unknown"),
+              "dependency_scan"  : os.environ.get("DEP_RESULT", "unknown"),
+              "iac_config_scan"  : os.environ.get("IAC_RESULT", "unknown"),
+          }
+
+          # ── Gate Policy ──────────────────────────────────────
+          # Điều chỉnh threshold này theo nhu cầu project/demo
+          CHECKOV_BLOCK_THRESHOLD = 5   # Block nếu failed checks >= threshold
+          block_reasons = []
+
+          if semgrep_missing:
+              block_reasons.append("Semgrep report không tồn tại — scanner có thể bị lỗi")
+          elif semgrep_errors > 0:
+              block_reasons.append(f"Semgrep phát hiện {semgrep_errors} finding mức ERROR")
+
+          if gitleaks_missing:
+              block_reasons.append("Gitleaks report không tồn tại — scanner có thể bị lỗi")
+          elif secret_count > 0:
+              block_reasons.append(f"Phát hiện {secret_count} secret bị lộ")
+
+          if pip_missing:
+              block_reasons.append("pip-audit report không tồn tại — scanner có thể bị lỗi")
+          elif pip_vuln_total > 0:
+              block_reasons.append(f"pip-audit phát hiện {pip_vuln_total} vulnerability")
+
+          if checkov_missing:
+              block_reasons.append("Checkov report không tồn tại — scanner có thể bị lỗi")
+          elif checkov_failed >= CHECKOV_BLOCK_THRESHOLD:
+              block_reasons.append(
+                  f"Checkov có {checkov_failed} failed checks "
+                  f"(vượt threshold {CHECKOV_BLOCK_THRESHOLD})"
+              )
+
+          should_block = len(block_reasons) > 0
+
+          # ── Ghi GitHub Step Summary ──────────────────────────
+          write("# 🔍 PR Scan — Gate Report")
+          write()
+
+          # Bảng trạng thái job
+          write("## Job Status")
+          write()
+          write("| Job | Runner Result |")
+          write("|-----|--------------|")
+          job_labels = {
+              "sast_scan"       : "SAST (Semgrep)",
+              "secret_scan"     : "Secret Scan (Gitleaks)",
+              "dependency_scan" : "Dependency Scan (pip-audit)",
+              "iac_config_scan" : "IaC/Config Scan (Checkov)",
+          }
+          for key, label in job_labels.items():
+              r = job_results[key]
+              if r == "success":
+                  icon = "✅"
+              elif r == "skipped":
+                  icon = "⚠️"
+              else:
+                  icon = "❌"
+              write(f"| {label} | {icon} {r} |")
+
+          write()
+
+          # ── Findings detail ──────────────────────────────────
+          write("## Findings")
+          write()
+
+          # Semgrep
+          write("### 🔎 SAST — Semgrep")
+          if semgrep_missing:
+              write("> ⚠️ Report không tìm thấy")
+          else:
+              write(f"- Tổng findings : **{semgrep_total}**")
+              write(f"- Mức ERROR     : **{semgrep_errors}** ← block trigger")
+              write(f"- Mức WARNING   : **{semgrep_warnings}**")
+              # Top-5 findings để dễ debug/demo
+              if semgrep_data and semgrep_data.get("results"):
+                  write("")
+                  write("<details><summary>Top findings (tối đa 5)</summary>")
+                  write("")
+                  write("| Severity | Rule | File | Message |")
+                  write("|----------|------|------|---------|")
+                  for r in semgrep_data["results"][:5]:
+                      sev  = r.get("extra", {}).get("severity", "?")
+                      rule = r.get("check_id", "?").split(".")[-1]   # rút gọn rule ID
+                      path = r.get("path", "?")
+                      line = r.get("start", {}).get("line", "")
+                      msg  = r.get("extra", {}).get("message", "")[:80]
+                      loc  = f"{path}:{line}" if line else path
+                      write(f"| `{sev}` | `{rule}` | `{loc}` | {msg} |")
+                  write("")
+                  write("</details>")
+          write()
+
+          # Gitleaks
+          write("### 🔑 Secret Scan — Gitleaks")
+          if gitleaks_missing:
+              write("> ⚠️ Report không tìm thấy")
+          else:
+              write(f"- Secrets phát hiện : **{secret_count}**")
+              # Top-5 secrets (che giá trị thật, chỉ hiện file/rule)
+              leaks = gitleaks_data if isinstance(gitleaks_data, list) \
+                      else gitleaks_data.get("leaks", [])
+              if leaks:
+                  write("")
+                  write("<details><summary>Top secrets (tối đa 5)</summary>")
+                  write("")
+                  write("| Rule | File | Line | Commit |")
+                  write("|------|------|------|--------|")
+                  for leak in leaks[:5]:
+                      rule   = leak.get("RuleID", leak.get("rule", "?"))
+                      fpath  = leak.get("File",   leak.get("file", "?"))
+                      lineno = leak.get("StartLine", leak.get("line", "?"))
+                      commit = str(leak.get("Commit", leak.get("commit", "?")))[:8]
+                      write(f"| `{rule}` | `{fpath}` | {lineno} | `{commit}` |")
+                  write("")
+                  write("</details>")
+          write()
+
+          # pip-audit
+          write("### 📦 Dependency Scan — pip-audit")
+          if pip_missing:
+              write("> ⚠️ Report không tìm thấy")
+          elif pip_skipped:
+              write("> ℹ️ Skipped — không có requirements file")
+          else:
+              write(f"- Vulnerabilities : **{pip_vuln_total}**")
+              if pip_vuln_pkgs:
+                  write("- Packages bị ảnh hưởng:")
+                  for pkg in pip_vuln_pkgs:
+                      write(f"  - `{pkg}`")
+                  # Chi tiết CVE (top 5 package đầu, mỗi package 3 CVE)
+                  deps = pip_data if isinstance(pip_data, list) \
+                         else pip_data.get("dependencies", [])
+                  vuln_deps = [d for d in deps if d.get("vulns")]
+                  if vuln_deps:
+                      write("")
+                      write("<details><summary>Chi tiết CVE (tối đa 5 package)</summary>")
+                      write("")
+                      for dep in vuln_deps[:5]:
+                          write(f"**{dep.get('name')}=={dep.get('version')}**")
+                          for v in dep["vulns"][:3]:
+                              vid  = v.get("id", "?")
+                              desc = v.get("description", v.get("fix_versions", ""))
+                              desc = str(desc)[:100]
+                              write(f"- `{vid}`: {desc}")
+                          write("")
+                      write("</details>")
+          write()
+
+          # Checkov
+          write("### 🏗️ IaC/Config Scan — Checkov")
+          if checkov_missing:
+              write("> ⚠️ Report không tìm thấy")
+          elif checkov_skipped:
+              write("> ℹ️ Skipped — không có file IaC/config")
+          else:
+              write(f"- Passed checks : **{checkov_passed}**")
+              write(f"- Failed checks : **{checkov_failed}**"
+                    f" (block threshold: {CHECKOV_BLOCK_THRESHOLD})")
+              # Top-5 failed checks
+              failed_checks = checkov_data.get("results", {}).get("failed_checks", [])
+              if failed_checks:
+                  write("")
+                  write("<details><summary>Top failed checks (tối đa 5)</summary>")
+                  write("")
+                  write("| Check ID | Check Name | File | Lines |")
+                  write("|----------|------------|------|-------|")
+                  for c in failed_checks[:5]:
+                      cid   = c.get("check_id", "?")
+                      cname = c.get("check_name", "?")[:60]
+                      fpath = c.get("file_path", "?")
+                      lines = c.get("file_line_range", ["?", "?"])
+                      lines_str = f"{lines[0]}-{lines[1]}" if isinstance(lines, list) else str(lines)
+                      write(f"| `{cid}` | {cname} | `{fpath}` | {lines_str} |")
+                  write("")
+                  write("</details>")
+          write()
+
+          # ── Kết luận Gate ────────────────────────────────────
+          write("---")
+          write()
+          if should_block:
+              write("## ❌ Block Merge")
+              write()
+              write("Lý do block:")
+              for reason in block_reasons:
+                  write(f"- {reason}")
+              write()
+              write("> *Điều chỉnh policy tại biến `CHECKOV_BLOCK_THRESHOLD` trong gate script.*")
+          else:
+              write("## ✅ Allow Merge")
+              write()
+              write("Tất cả scanner hoàn thành, không có finding vượt policy.")
+
+          write()
+          write("---")
+          write(f"*Artifacts được lưu 30 ngày để dùng làm audit evidence.*")
+
+          # ── Exit code ────────────────────────────────────────
+          if should_block:
+              print("\n❌ GATE: Block Merge")
+              for r in block_reasons:
+                  print(f"  - {r}")
+              sys.exit(1)
+          else:
+              print("\n✅ GATE: Allow Merge")
+              sys.exit(0)
+
+          PYTHON_SCRIPT
+
+        env:
+          SAST_RESULT:   ${{ needs.sast_scan.result }}
+          SECRET_RESULT: ${{ needs.secret_scan.result }}
+          DEP_RESULT:    ${{ needs.dependency_scan.result }}
+          IAC_RESULT:    ${{ needs.iac_config_scan.result }}
