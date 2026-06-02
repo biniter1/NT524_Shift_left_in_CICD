@@ -555,6 +555,18 @@ jobs:
 
           echo "Cleaning old runner SSH tunnels..."
           pkill -f "ssh.*8000:127.0.0.1:18000" || true
+          pkill -f "ssh.*-L 8000" || true
+
+          echo "Cleaning old remote port-forward on EC2..."
+          ssh -i ~/.ssh/ec2_key.pem \
+            -o ServerAliveInterval=30 \
+            -o ServerAliveCountMax=3 \
+            ubuntu@${{ secrets.EC2_HOST }} \
+            "pkill -f 'kubectl.*port-forward.*restaurant-app' || true; \
+            pkill -f 'kubectl.*port-forward.*18000' || true; \
+            sudo fuser -k 18000/tcp 2>/dev/null || true; \
+            sleep 3" \
+            > dast-out/remote-cleanup.txt 2>&1 || true
 
           echo "Starting remote kubectl port-forward on EC2..."
           ssh -i ~/.ssh/ec2_key.pem \
@@ -562,8 +574,6 @@ jobs:
             -o ServerAliveCountMax=3 \
             ubuntu@${{ secrets.EC2_HOST }} \
             "kind export kubeconfig --name staging 2>/dev/null || true; \
-            pkill -f 'kubectl port-forward.*18000:8000' || true; \
-            sleep 2; \
             nohup kubectl port-forward svc/restaurant-app 18000:8000 \
               -n staging --address 127.0.0.1 > /tmp/pf-dast.log 2>&1 & \
             echo \$! > /tmp/pf-dast.pid; \
@@ -596,6 +606,9 @@ jobs:
           else
             echo "{\"expose_status\":\"failed\",\"method\":\"port-forward-tunnel\",\"remote_exit\":${REMOTE_EXIT},\"tunnel_exit\":${TUNNEL_EXIT},\"local_exit\":${LOCAL_EXIT}}" > dast-out/expose-status.json
             echo "❌ DAST target not ready"
+
+            echo "===== remote-cleanup ====="
+            cat dast-out/remote-cleanup.txt || true
 
             echo "===== remote-portforward ====="
             cat dast-out/remote-portforward.txt || true
@@ -641,82 +654,54 @@ jobs:
         run: |
           mkdir -p zap-out
 
-          EXPOSE_STATUS="unknown"
+          python3 << 'PY'
+          import json
+          import os
 
-          if [ -f "dast-out/expose-status.json" ]; then
-            EXPOSE_STATUS=$(python3 << 'PY'
-              import json
-              try:
-                  with open("dast-out/expose-status.json", "r", encoding="utf-8") as f:
-                      d = json.load(f)
-                  print(d.get("expose_status", "unknown"))
-              except Exception:
-                  print("unknown")
-              PY
-              )
-          fi
+          expose_status = "unknown"
 
-          if [ "$EXPOSE_STATUS" != "success" ]; then
-            cat > zap-out/zap-summary.json <<EOF
-              {"high":0,"medium":0,"low":0,"report_missing":true,"expose_status":"${EXPOSE_STATUS}"}
-            EOF
-            cat zap-out/zap-summary.json
-            exit 0
-          fi
+          try:
+              with open("dast-out/expose-status.json", "r", encoding="utf-8") as f:
+                  expose = json.load(f)
+              if isinstance(expose, dict):
+                  expose_status = expose.get("expose_status", "unknown")
+          except Exception:
+              pass
 
-          if [ -f "report_json.json" ]; then
-            HIGH=$(python3 << 'PY'
-              import json
+          result = {
+              "high": 0,
+              "medium": 0,
+              "low": 0,
+              "report_missing": True,
+              "expose_status": expose_status,
+          }
+
+          if expose_status == "success" and os.path.exists("report_json.json"):
               try:
                   with open("report_json.json", "r", encoding="utf-8") as f:
                       data = json.load(f)
+
                   alerts = []
-                  for site in data.get("site", []):
-                      alerts.extend(site.get("alerts", []))
-                  print(sum(1 for a in alerts if str(a.get("riskcode", "")) == "3"))
-              except Exception:
-                  print(0)
-              PY
-              )
+                  if isinstance(data, dict):
+                      for site in data.get("site", []):
+                          if isinstance(site, dict):
+                              site_alerts = site.get("alerts", [])
+                              if isinstance(site_alerts, list):
+                                  alerts.extend([a for a in site_alerts if isinstance(a, dict)])
 
-            MEDIUM=$(python3 << 'PY'
-              import json
-              try:
-                  with open("report_json.json", "r", encoding="utf-8") as f:
-                      data = json.load(f)
-                  alerts = []
-                  for site in data.get("site", []):
-                      alerts.extend(site.get("alerts", []))
-                  print(sum(1 for a in alerts if str(a.get("riskcode", "")) == "2"))
-              except Exception:
-                  print(0)
-              PY
-              )
+                  result["high"] = sum(1 for a in alerts if str(a.get("riskcode", "")) == "3")
+                  result["medium"] = sum(1 for a in alerts if str(a.get("riskcode", "")) == "2")
+                  result["low"] = sum(1 for a in alerts if str(a.get("riskcode", "")) == "1")
+                  result["report_missing"] = False
 
-            LOW=$(python3 << 'PY'
-              import json
-              try:
-                  with open("report_json.json", "r", encoding="utf-8") as f:
-                      data = json.load(f)
-                  alerts = []
-                  for site in data.get("site", []):
-                      alerts.extend(site.get("alerts", []))
-                  print(sum(1 for a in alerts if str(a.get("riskcode", "")) == "1"))
-              except Exception:
-                  print(0)
-              PY
-              )
+              except Exception as e:
+                  result["parse_error"] = str(e)
 
-            cat > zap-out/zap-summary.json <<EOF
-            {"high":${HIGH},"medium":${MEDIUM},"low":${LOW},"report_missing":false,"expose_status":"success"}
-            EOF
-          else
-            cat > zap-out/zap-summary.json <<EOF
-            {"high":0,"medium":0,"low":0,"report_missing":true,"expose_status":"success"}
-            EOF
-          fi
+          with open("zap-out/zap-summary.json", "w", encoding="utf-8") as f:
+              json.dump(result, f)
 
-          cat zap-out/zap-summary.json
+          print(json.dumps(result, indent=2))
+          PY
         continue-on-error: true
 
       - name: Upload artifact — zap-summary
