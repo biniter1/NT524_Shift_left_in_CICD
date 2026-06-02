@@ -373,10 +373,10 @@ jobs:
       - name: Deploy to staging
         id: deploy
         run: |
-          # set +e: tắt fail-fast để $? luôn được bắt sau SSH dù lệnh fail
           set +e
           ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
             IMAGE="${{ env.IMAGE_NAME }}@${{ needs.verify_gate.outputs.digest }}" \
+            LOCAL_IMAGE="restaurant-app:staging-${{ github.sha }}" \
             ACTOR="${{ github.actor }}" \
             TOKEN="${{ secrets.GITHUB_TOKEN }}" \
             bash << 'REMOTE'
@@ -388,15 +388,21 @@ jobs:
               || { echo "❌ staging cluster not found"; exit 1; }
             kind export kubeconfig --name staging
 
-            # Deploy bằng digest (immutable) thay vì tag có thể bị ghi đè
+            # Pull artifact đã verify theo digest
             docker pull --platform linux/amd64 "$IMAGE"
-            kind load docker-image "$IMAGE" --name staging
+
+            # Tag lại thành local image tag để kind load ổn định hơn
+            docker tag "$IMAGE" "$LOCAL_IMAGE"
+
+            # Load local tag vào kind, không load trực tiếp repo@sha256
+            kind load docker-image "$LOCAL_IMAGE" --name staging
 
             kubectl delete namespace staging --ignore-not-found=true
             sleep 3
             kubectl apply -f /home/ubuntu/k8s-staging/namespace.yaml
             kubectl apply -f /home/ubuntu/k8s-staging/postgres.yaml
-            sed "s|IMAGE_PLACEHOLDER|${IMAGE}|g" \
+
+            sed "s|IMAGE_PLACEHOLDER|${LOCAL_IMAGE}|g" \
               /home/ubuntu/k8s-staging/app.yaml | kubectl apply -f -
 
             kubectl rollout status deployment/postgres \
@@ -404,12 +410,11 @@ jobs:
             kubectl rollout status deployment/restaurant-app \
               -n staging --timeout=180s
 
-            echo "✅ Deployed to staging"
+            echo "✅ Deployed to staging with local image: $LOCAL_IMAGE"
           REMOTE
-          # Bắt $? ngay sau SSH — set +e đảm bảo dòng này luôn chạy
+
           DEPLOY_EXIT=$?
           echo "DEPLOY_EXIT=${DEPLOY_EXIT}" >> $GITHUB_ENV
-          # exit 0 để step không fail; gate sẽ đọc DEPLOY_EXIT để quyết định
           exit 0
 
         continue-on-error: true
@@ -915,23 +920,26 @@ jobs:
         run: |
           ssh -i ~/.ssh/ec2_key.pem ubuntu@${{ secrets.EC2_HOST }} \
             IMAGE="${{ env.IMAGE_NAME }}@${{ needs.verify_gate.outputs.digest }}" \
+            LOCAL_IMAGE="restaurant-app:production-${{ github.sha }}" \
             ACTOR="${{ github.actor }}" \
             TOKEN="${{ secrets.GITHUB_TOKEN }}" \
             bash << 'REMOTE'
             set -e
+
             echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
 
             kind get clusters | grep -q staging \
               || { echo "❌ cluster not found"; exit 1; }
             kind export kubeconfig --name staging
 
-            # Deploy bằng digest (immutable) — cùng mindset supply chain với staging
             docker pull --platform linux/amd64 "$IMAGE"
-            kind load docker-image "$IMAGE" --name staging
+            docker tag "$IMAGE" "$LOCAL_IMAGE"
+            kind load docker-image "$LOCAL_IMAGE" --name staging
 
             kubectl apply -f /home/ubuntu/k8s-production/namespace.yaml
             kubectl apply -f /home/ubuntu/k8s-production/postgres.yaml
-            sed "s|IMAGE_PLACEHOLDER|${IMAGE}|g" \
+
+            sed "s|IMAGE_PLACEHOLDER|${LOCAL_IMAGE}|g" \
               /home/ubuntu/k8s-production/app.yaml | kubectl apply -f -
 
             kubectl rollout status deployment/postgres \
@@ -939,7 +947,7 @@ jobs:
             kubectl rollout status deployment/restaurant-app \
               -n production --timeout=180s
 
-            echo "✅ Base deploy done"
+            echo "✅ Base deploy done with local image: $LOCAL_IMAGE"
           REMOTE
         continue-on-error: true
 
