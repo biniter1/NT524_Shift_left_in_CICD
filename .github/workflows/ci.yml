@@ -80,7 +80,7 @@ jobs:
 
       - name: Upload artifact — semgrep-report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: semgrep-report
           path: reports/semgrep.json
@@ -117,7 +117,7 @@ jobs:
 
       - name: Upload artifact — secret-scan-report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: secret-scan-report
           path: reports/gitleaks.json
@@ -173,7 +173,7 @@ jobs:
 
       - name: Upload artifact — dependency-report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dependency-report
           path: reports/pip-audit.json
@@ -233,7 +233,7 @@ jobs:
 
       - name: Upload artifact — checkov-report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: checkov-report
           path: reports/checkov.json
@@ -278,7 +278,7 @@ jobs:
 
       - name: Upload artifact — unit-test-report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: unit-test-report
           path: reports/pytest.xml
@@ -810,7 +810,7 @@ jobs:
           echo "Digest : ${{ steps.build.outputs.digest }}"
 
       - name: Upload artifact — image-digest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: image-digest
           path: reports/image-digest.txt
@@ -867,7 +867,7 @@ jobs:
 
       - name: Upload artifact — trivy-report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: trivy-report
           path: reports/trivy.json
@@ -894,7 +894,7 @@ jobs:
 
       - name: Upload artifact — sbom-report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom-report
           path: reports/sbom.cdx.json
@@ -1272,7 +1272,7 @@ jobs:
 
       - name: Upload artifact — cosign-verify-report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cosign-verify-report
           path: cosign-verify-result.txt
