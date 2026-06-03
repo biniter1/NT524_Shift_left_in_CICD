@@ -1,12 +1,10 @@
 repos:
-  # ─── LAYER 1: SECRET SCAN ─────────────────────────────────
   - repo: https://github.com/gitleaks/gitleaks
     rev: v8.18.4
     hooks:
       - id: gitleaks
         name: "🔐 Secret scan (Gitleaks)"
 
-  # ─── LAYER 2: CODE QUALITY ────────────────────────────────
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:

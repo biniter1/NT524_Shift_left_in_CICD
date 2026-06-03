@@ -35,8 +35,7 @@ jobs:
           python-version: "3.11"
 
       - name: Run Semgrep — xuất JSON report
-        # Semgrep exit 1 khi có finding → dùng || true để job không fail
-        # Dùng git merge-base để lấy common ancestor chính xác của PR với develop
+
         run: |
           pip install semgrep --quiet
           mkdir -p reports
