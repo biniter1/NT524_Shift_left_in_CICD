@@ -77,7 +77,7 @@ jobs:
           fi
 
           if [ -n "$DIGEST" ]; then
-            echo "$DIGEST" > reports/image-digest.txt
+            echo "$DIGEST" > reports/image-digest.txt 
             echo "digest_status=ok" > reports/inspect-status.txt
             echo "Resolved image digest: $DIGEST"
           else
