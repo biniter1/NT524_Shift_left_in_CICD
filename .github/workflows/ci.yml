@@ -301,7 +301,7 @@ jobs:
       passed: ${{ steps.gate.outputs.passed }}
     steps:
       - name: Download tất cả scan artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ./artifacts
         continue-on-error: true
@@ -926,7 +926,7 @@ jobs:
       digest: ${{ needs.build_image.outputs.digest }}
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ./artifacts
         continue-on-error: true
@@ -1224,7 +1224,7 @@ jobs:
       id-token:  write   # bắt buộc cho Cosign keyless signing
     steps:
       - name: Download SBOM
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: sbom-report
           path: ./sbom

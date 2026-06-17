@@ -233,7 +233,7 @@ jobs:
       digest: ${{ steps.gate.outputs.digest }}
     steps:
       - name: Download verify artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ./artifacts
         continue-on-error: true
@@ -771,7 +771,7 @@ jobs:
       passed: ${{ steps.gate.outputs.passed }}
     steps:
       - name: Download staging artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ./artifacts
         continue-on-error: true
@@ -1250,7 +1250,7 @@ jobs:
       passed: ${{ steps.gate.outputs.passed }}
     steps:
       - name: Download production artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ./artifacts
         continue-on-error: true
@@ -1502,7 +1502,7 @@ jobs:
     if: always()
     steps:
       - name: Download artifacts để lấy ZAP và digest
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           path: ./artifacts
         continue-on-error: true
