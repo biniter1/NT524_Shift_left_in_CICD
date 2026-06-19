@@ -43,7 +43,7 @@ jobs:
           category: semgrep-pr
 
       - name: Save SAST results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         if: always()
         with:
           name: sast-pr-${{ github.sha }}
@@ -116,7 +116,7 @@ jobs:
 
       - name: Save config results
         if: steps.config-check.outputs.changed == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: config-pr-${{ github.sha }}
           path: checkov-pr.sarif
@@ -177,7 +177,7 @@ jobs:
 
       - name: Save results
         if: steps.dep-changed.outputs.changed == 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dep-pr-${{ github.sha }}
           path: pip-audit-pr.json
@@ -212,7 +212,7 @@ jobs:
             || true
 
       - name: Save results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lib-pr-${{ github.sha }}
           path: library-scan-pr.json

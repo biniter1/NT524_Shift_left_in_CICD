@@ -95,7 +95,7 @@ jobs:
 
       - name: Upload artifact — image-digest
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: image-digest
           path: |
@@ -131,7 +131,7 @@ jobs:
 
       - name: Upload artifact — cosign-verify-report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cosign-verify-report
           path: |
@@ -167,7 +167,7 @@ jobs:
 
       - name: Upload artifact — sbom-attestation-report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sbom-attestation-report
           path: |
@@ -209,7 +209,7 @@ jobs:
 
       - name: Upload artifact — verify-artifact-report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: verify-artifact-report
           path: reports/verify-artifact-report.json
@@ -451,7 +451,7 @@ jobs:
 
       - name: Upload artifact — staging-deployment-evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: staging-deployment-evidence
           path: staging-evidence/
@@ -495,7 +495,7 @@ jobs:
 
       - name: Upload artifact — smoke-report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: smoke-report
           path: smoke-out/smoke-report.json
@@ -539,7 +539,7 @@ jobs:
 
       - name: Upload artifact — perf-report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: perf-report
           path: perf-out/perf-report.json
@@ -625,7 +625,7 @@ jobs:
         continue-on-error: true
       - name: Upload artifact — dast-expose-status
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: dast-expose-status
           path: dast-out/
@@ -706,7 +706,7 @@ jobs:
 
       - name: Upload artifact — zap-summary
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: zap-summary
           path: zap-out/zap-summary.json
@@ -1145,7 +1145,7 @@ jobs:
 
       - name: Upload artifact — production-deploy-report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: production-deploy-report
           path: prod-evidence/
@@ -1191,7 +1191,7 @@ jobs:
 
       - name: Upload artifact — production-smoke-report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: production-smoke-report
           path: prod-smoke-out/production-smoke-report.json
@@ -1228,7 +1228,7 @@ jobs:
 
       - name: Upload artifact — rollback-record
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: rollback-record
           path: rollback-out/rollback-record.txt
@@ -1442,7 +1442,7 @@ jobs:
 
       - name: Upload artifact — observability-report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: observability-report
           path: obs-out/observability-report.txt
@@ -1476,7 +1476,7 @@ jobs:
 
       - name: Upload artifact — falco-status-report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: falco-status-report
           path: falco-out/falco-status-report.txt
